@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: optionbuddy-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading_agent
+      POSTGRES_USER: trading_user
+      POSTGRES_PASSWORD: trading_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading_user -d trading_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trading-agent:
+    build: .
+    container_name: optionbuddy-trading-agent
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - trading-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+
+networks:
+  trading-network:
+    driver: bridge
