@@ -19,10 +19,11 @@ services:
       timeout: 5s
       retries: 5
 
-  trading-agent:
+  advisory-agent:
     build: .
-    container_name: optionbuddy-trading-agent
+    container_name: optionbuddy-advisory
     restart: unless-stopped
+    command: ["python", "main_advisory.py"]
     depends_on:
       postgres:
         condition: service_healthy
