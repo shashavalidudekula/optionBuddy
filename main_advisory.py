@@ -35,7 +35,8 @@ from data.advisory_store import (
 )
 from signals.advisory_engine import generate_calls
 from core.call_tracker import track_active_calls
-from core.advisory_market_data import get_market_snapshot, make_price_lookup
+from core.indstocks_auth import get_session
+from core.indstocks_data import get_market_snapshot, make_price_lookup, get_option_chain
 from data.news_fetcher import get_top_headlines
 from notifier.telegram_advisory_bot import (
     TelegramAdvisoryBot,
@@ -72,16 +73,29 @@ def _in_market_hours(now: datetime) -> bool:
 
 # ── Work units (sync, run in threads) ─────────────────────────────────────────
 
-def _generate_all_categories() -> list[tuple[dict, int]]:
+def _generate_all_categories(session) -> list[tuple[dict, int]]:
     """Generate + persist fresh calls across all categories. Returns (call, id)."""
     headlines = get_top_headlines()
-    market = get_market_snapshot()
+    market = get_market_snapshot(session)
     exclude = active_instruments()
 
     saved: list[tuple[dict, int]] = []
     for cat in CATEGORIES:
+        cat_market = market
+        if cat == "index_option" and session is not None:
+            # Ground option calls in real, tradeable premiums (nearest expiry, ATM±N).
+            try:
+                cat_market = {
+                    **market,
+                    "option_chain": {
+                        "NIFTY": get_option_chain(session, "NIFTY"),
+                        "BANKNIFTY": get_option_chain(session, "BANKNIFTY"),
+                    },
+                }
+            except Exception as e:
+                log.warning("Option-chain fetch failed: %s", e)
         try:
-            calls = generate_calls(cat, market, headlines, exclude_instruments=exclude)
+            calls = generate_calls(cat, cat_market, headlines, exclude_instruments=exclude)
         except Exception as e:
             log.error("Generation failed for %s: %s", cat, e)
             continue
@@ -98,8 +112,8 @@ def _generate_all_categories() -> list[tuple[dict, int]]:
 
 # ── Async cycles ──────────────────────────────────────────────────────────────
 
-async def run_generation_cycle(bot: TelegramAdvisoryBot) -> None:
-    saved = await asyncio.to_thread(_generate_all_categories)
+async def run_generation_cycle(bot: TelegramAdvisoryBot, session) -> None:
+    saved = await asyncio.to_thread(_generate_all_categories, session)
     for call, call_id in saved:
         await bot.push_new_call(call, call_id)
     log.info("Generation cycle published %s call(s)", len(saved))
@@ -166,10 +180,18 @@ async def run() -> None:
     init_advisory_db()
     log.info("Advisory DB ready")
 
+    # INDstocks is the live market-data feed (data only — no execution).
+    try:
+        session = get_session()
+    except Exception as e:
+        session = None
+        log.error("INDstocks session unavailable (%s). Running with global cues only; "
+                  "option/equity tracking will rely on expiry until a token is set.", e)
+
     bot = TelegramAdvisoryBot()
     await bot.start_polling()
 
-    price_lookup = make_price_lookup()
+    price_lookup = make_price_lookup(session)
 
     last_gen: datetime | None = None
     briefing_date = None
@@ -197,7 +219,7 @@ async def run() -> None:
                 if (last_gen is None
                         or (now - last_gen).total_seconds() >= GENERATION_INTERVAL_MIN * 60):
                     try:
-                        await run_generation_cycle(bot)
+                        await run_generation_cycle(bot, session)
                     except Exception as e:
                         log.error("Generation cycle failed: %s", e)
                     last_gen = now

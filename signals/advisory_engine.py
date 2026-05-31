@@ -1,9 +1,9 @@
 """
 advisory_engine.py — AI research engine that generates trade-idea "calls".
 
-Unlike the portfolio signal engine (claude_engine.py), this does NOT react to a
-user's existing positions. It scans the market and produces fresh advisory calls
-with full trade parameters: entry, target(s), stop-loss, and a research rationale.
+This does NOT react to a user's existing positions. It scans the market and
+produces fresh advisory calls with full trade parameters: entry, target(s),
+stop-loss, and a research rationale.
 
 Categories:
   - index_option : NIFTY / BANKNIFTY weekly option calls (strike, entry premium, T1/T2, SL)
@@ -36,7 +36,11 @@ _CATEGORY_GUIDANCE = {
         "Focus on NIFTY and BANKNIFTY weekly options. Recommend a specific option "
         "(e.g. 'NIFTY 24500 CE'). All prices (entry/target/stop) are OPTION PREMIUMS in INR, "
         "not index points. Account for theta decay and IV. Prefer slightly OTM/ATM strikes "
-        "with liquidity. Timeframe is usually 'intraday'."
+        "with liquidity. Timeframe is usually 'intraday'.\n"
+        "IMPORTANT: When an 'option_chain' is provided in the market snapshot, you MUST pick a "
+        "strike that exists in it and set 'entry_price' at (or very close to) that strike's live "
+        "'premium'. Derive 'target_1'/'target_2'/'stop_loss' from that live premium so the call "
+        "is realistic and trackable. Do not invent premiums that contradict the chain."
     ),
     "equity": (
         "Focus on liquid NSE cash stocks (large/mid cap). Recommend BUY or SELL with a cash "
