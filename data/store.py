@@ -94,14 +94,14 @@ def init_db() -> None:
 
 # ── Signals ────────────────────────────────────────────────────────────────────
 
-def save_signal(signal: dict) -> int:
+def save_signal(signal: dict, user_id: str = "default_single_user", signal_scope: str = "personal") -> int:
     """Insert a signal record, return its ID."""
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            """INSERT INTO signals (ts, instrument, signal, confidence, urgency, reason, raw_json)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """INSERT INTO signals (ts, instrument, signal, confidence, urgency, reason, raw_json, user_id, signal_scope)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                RETURNING id""",
             (
                 datetime.now().isoformat(),
@@ -111,6 +111,8 @@ def save_signal(signal: dict) -> int:
                 signal.get("urgency"),
                 signal.get("reason"),
                 json.dumps(signal),
+                user_id,
+                signal_scope,
             ),
         )
         signal_id = cur.fetchone()[0]
@@ -135,12 +137,14 @@ def mark_signal_acted(signal_id: int, outcome: str) -> None:
         conn.close()
 
 
-def recent_signals(limit: int = 20) -> list[dict]:
+def recent_signals(limit: int = 20, user_id: str = "default_single_user") -> list[dict]:
+    """Fetch recent signals for a specific user."""
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT * FROM signals ORDER BY ts DESC LIMIT %s", (limit,)
+            "SELECT * FROM signals WHERE user_id = %s ORDER BY ts DESC LIMIT %s",
+            (user_id, limit)
         )
         rows = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
@@ -152,13 +156,14 @@ def recent_signals(limit: int = 20) -> list[dict]:
 
 # ── Trades ─────────────────────────────────────────────────────────────────────
 
-def save_trade(trade: dict) -> int:
+def save_trade(trade: dict, user_id: str = "default_single_user") -> int:
+    """Insert a trade record, return its ID."""
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            """INSERT INTO trades (ts, instrument, txn_type, quantity, price, order_id, signal_id, pnl_realised, notes)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """INSERT INTO trades (ts, instrument, txn_type, quantity, price, order_id, signal_id, pnl_realised, notes, user_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                RETURNING id""",
             (
                 datetime.now().isoformat(),
@@ -170,6 +175,7 @@ def save_trade(trade: dict) -> int:
                 trade.get("signal_id"),
                 trade.get("pnl_realised"),
                 trade.get("notes"),
+                user_id,
             ),
         )
         trade_id = cur.fetchone()[0]
@@ -182,22 +188,140 @@ def save_trade(trade: dict) -> int:
 
 # ── P&L Snapshots ──────────────────────────────────────────────────────────────
 
-def save_pnl_snapshot(unrealised: float, realised: float, positions: list) -> None:
+def save_pnl_snapshot(unrealised: float, realised: float, positions: list, user_id: str = "default_single_user") -> None:
+    """Save P&L snapshot for a user."""
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            """INSERT INTO pnl_snapshots (ts, unrealised, realised, net, positions_json)
-               VALUES (%s, %s, %s, %s, %s)""",
+            """INSERT INTO pnl_snapshots (ts, unrealised, realised, net, positions_json, user_id)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
             (
                 datetime.now().isoformat(),
                 unrealised,
                 realised,
                 unrealised + realised,
                 json.dumps(positions),
+                user_id,
             ),
         )
         conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── Multi-Tenant Helpers ────────────────────────────────────────────────────
+
+def get_user(user_id: str) -> dict | None:
+    """Fetch user by user_id."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, telegram_chat_id, username, broker_type, signal_mode, is_paused FROM users WHERE user_id = %s",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        columns = [desc[0] for desc in cur.description]
+        return dict(zip(columns, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_user_by_chat_id(chat_id: int) -> dict | None:
+    """Fetch user by Telegram chat_id."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, telegram_chat_id, username, broker_type, signal_mode, is_paused FROM users WHERE telegram_chat_id = %s",
+            (chat_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        columns = [desc[0] for desc in cur.description]
+        return dict(zip(columns, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_all_active_users() -> list[dict]:
+    """Fetch all non-paused users."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, telegram_chat_id, username, broker_type, signal_mode, is_paused FROM users WHERE is_paused = FALSE ORDER BY created_at"
+        )
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_user_signals(user_id: str, signal_scope: str | None = None, limit: int = 20) -> list[dict]:
+    """Fetch signals for a user, optionally filtered by scope."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        if signal_scope:
+            cur.execute(
+                "SELECT * FROM signals WHERE user_id = %s AND signal_scope = %s ORDER BY ts DESC LIMIT %s",
+                (user_id, signal_scope, limit)
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM signals WHERE user_id = %s ORDER BY ts DESC LIMIT %s",
+                (user_id, limit)
+            )
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_user_trades(user_id: str, limit: int = 20) -> list[dict]:
+    """Fetch trades for a user."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM trades WHERE user_id = %s ORDER BY ts DESC LIMIT %s",
+            (user_id, limit)
+        )
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_user_pnl_summary(user_id: str) -> dict | None:
+    """Get latest P&L snapshot for a user."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT ts, unrealised, realised, net, positions_json FROM pnl_snapshots
+               WHERE user_id = %s ORDER BY ts DESC LIMIT 1""",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        columns = [desc[0] for desc in cur.description]
+        return dict(zip(columns, row))
     finally:
         cur.close()
         conn.close()
