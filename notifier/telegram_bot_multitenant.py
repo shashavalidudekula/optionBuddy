@@ -290,14 +290,29 @@ class TelegramBotMultitenant:
         signal: dict,
         signal_id: int,
         chat_id: int,
-        is_shared: bool = False
+        is_shared: bool = False,
+        user_id: str = None
     ) -> None:
-        """Send signal alert to a specific user."""
+        """Send signal alert to a specific user.
+
+        Args:
+            signal: Signal dict
+            signal_id: Unique signal ID
+            chat_id: Telegram chat ID for the user
+            is_shared: Whether this is a shared signal
+            user_id: User ID (auto-looked up from chat_id if not provided)
+        """
+        # Look up user_id from chat_id if not provided
+        if not user_id:
+            from data.store import get_user_by_chat_id
+            user = get_user_by_chat_id(chat_id)
+            user_id = user['user_id'] if user else "unknown"
+
         text = _signal_message(signal, signal_id, is_shared)
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Execute", callback_data=f"approve:{signal_id}"),
-                InlineKeyboardButton("❌ Skip", callback_data=f"reject:{signal_id}"),
+                InlineKeyboardButton("✅ Execute", callback_data=f"approve:{user_id}:{signal_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data=f"reject:{user_id}:{signal_id}"),
             ]
         ])
 

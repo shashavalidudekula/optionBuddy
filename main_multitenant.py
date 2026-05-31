@@ -37,7 +37,8 @@ from data.store import (
     get_all_active_users, get_user
 )
 from signals.claude_engine import get_signal
-from notifier.telegram_bot import TelegramBot
+from signals.shared_signals import get_shared_signal
+from notifier.telegram_bot_multitenant import TelegramBotMultitenant
 from config.settings import POLL_INTERVAL_SEC, MARKET_OPEN, MARKET_CLOSE
 from config.logger import get_logger
 
@@ -48,7 +49,7 @@ log = get_logger("main")
 # ============================================================================
 
 users: Dict[str, UserContext] = {}  # user_id -> UserContext
-bot: TelegramBot = None
+bot: TelegramBotMultitenant = None
 
 
 # ============================================================================
@@ -203,6 +204,7 @@ async def run_trading_loop(db) -> None:
     midday_briefing_sent_today = False
     afternoon_news_sent_today = False
     last_briefing_date = None
+    last_shared_signal_time = None  # Track last market-wide shared signal
 
     while True:
         try:
@@ -307,6 +309,37 @@ async def run_trading_loop(db) -> None:
                     except Exception as e:
                         log.error(f"Error sending afternoon news: {e}")
 
+            # 10:00 AM & 2:00 PM: Generate and broadcast market-wide shared signals
+            if current_time >= "09:55" and current_time < "10:05":
+                if not last_shared_signal_time or (now - last_shared_signal_time).total_seconds() > 7200:  # 2 hours
+                    try:
+                        log.info("Generating market-wide shared signal...")
+                        market = get_all_market_data(get_session())
+                        headlines = get_top_headlines(limit=8)
+
+                        shared_signal = await get_shared_signal(market, headlines)
+                        if shared_signal and shared_signal.get("setup") != "HOLD":
+                            log.info(f"Broadcasting shared signal: {shared_signal.get('setup')}")
+                            await broadcast_market_wide_signal(shared_signal, db)
+                            last_shared_signal_time = now
+                    except Exception as e:
+                        log.error(f"Error generating shared signal: {e}")
+
+            elif current_time >= "13:55" and current_time < "14:05":
+                if not last_shared_signal_time or (now - last_shared_signal_time).total_seconds() > 7200:  # 2 hours
+                    try:
+                        log.info("Generating afternoon market-wide shared signal...")
+                        market = get_all_market_data(get_session())
+                        headlines = get_top_headlines(limit=8)
+
+                        shared_signal = await get_shared_signal(market, headlines)
+                        if shared_signal and shared_signal.get("setup") != "HOLD":
+                            log.info(f"Broadcasting shared signal: {shared_signal.get('setup')}")
+                            await broadcast_market_wide_signal(shared_signal, db)
+                            last_shared_signal_time = now
+                    except Exception as e:
+                        log.error(f"Error generating afternoon shared signal: {e}")
+
             # Midnight: Reset daily flags
             if current_time >= "00:05" and current_time < "00:10":
                 if briefing_sent_today or midday_briefing_sent_today or afternoon_news_sent_today:
@@ -380,7 +413,7 @@ async def run_trading_loop(db) -> None:
 
                         # Send alert to this user
                         ctx.add_pending_signal(signal_id, signal)
-                        await bot.send_signal_alert(signal, signal_id, ctx.telegram_chat_id)
+                        await bot.send_signal_alert(signal, signal_id, ctx.telegram_chat_id, user_id=user_id)
 
                     # Save P&L snapshot every 10 cycles
                     if loop_count % 10 == 0:
@@ -413,8 +446,56 @@ async def run_trading_loop(db) -> None:
 # Shared Signal Broadcasting (Phase 5)
 # ============================================================================
 
+async def broadcast_market_wide_signal(shared_signal: dict, db) -> None:
+    """Broadcast market-wide signal to all users in 'shared' or 'both' mode.
+
+    This is for automatically-generated market signals (not from a user's portfolio).
+    """
+    try:
+        # Save signal to DB first to get signal_id
+        signal_id = save_signal(
+            {**shared_signal, 'scope': 'shared'},
+            user_id="system",  # System-generated signal
+            signal_scope='shared'
+        )
+
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT user_id, telegram_chat_id FROM users "
+            "WHERE signal_mode IN ('shared', 'both') AND is_paused = FALSE"
+        )
+
+        users_to_notify = cursor.fetchall()
+        cursor.close()
+
+        if not users_to_notify:
+            log.info("No users subscribed to shared signals")
+            return
+
+        for user_id, chat_id in users_to_notify:
+            try:
+                # Send market-wide signal to user
+                await bot.send_signal_alert(shared_signal, signal_id, chat_id, is_shared=True)
+
+                # Add to pending signals
+                ctx = users.get(user_id)
+                if ctx:
+                    ctx.add_pending_signal(signal_id, shared_signal)
+
+                log.info(f"Sent market signal #{signal_id} to user {user_id}")
+
+            except Exception as e:
+                log.error(f"Failed to send market signal to user {user_id}: {e}")
+
+    except Exception as e:
+        log.error(f"Market-wide broadcast error: {e}")
+
+
 async def broadcast_shared_signal(signal: dict, signal_id: int, sender_user_id: str, db) -> None:
-    """Broadcast shared signal to all users in 'shared' or 'both' mode."""
+    """Broadcast shared signal to all users in 'shared' or 'both' mode.
+
+    This is when a user's personal signal is promoted to shared (if they have 'both' mode).
+    """
     try:
         cursor = db.cursor()
         cursor.execute(
@@ -482,8 +563,8 @@ async def main() -> None:
     if not users:
         log.warning("No active users loaded. Agent running but idle.")
 
-    # Initialize Telegram bot
-    bot = TelegramBot()
+    # Initialize Telegram bot (multi-tenant)
+    bot = TelegramBotMultitenant()
     bot.register_user_callbacks(on_approve, on_reject)
     await bot.start_polling()
 
