@@ -8,6 +8,7 @@ Usage:
   # When user taps ❌, on_reject(signal_id) is called
 """
 import asyncio
+import os
 from typing import Callable, Awaitable
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -72,6 +73,8 @@ class TelegramBot:
         self._reject_cb = on_reject
 
     def _setup_handlers(self) -> None:
+        self.app.add_handler(CommandHandler("start", self._cmd_start))
+        self.app.add_handler(CommandHandler("verify", self._cmd_verify))
         self.app.add_handler(CommandHandler("pause",  self._cmd_pause))
         self.app.add_handler(CommandHandler("resume", self._cmd_resume))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
@@ -82,6 +85,74 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self._button_handler))
 
     # ── Commands ───────────────────────────────────────────────────────────────
+
+    async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command — may include user_id from web dashboard link."""
+        chat_id = update.effective_chat.id
+        user_id = None
+
+        # Check if user_id was passed as parameter from web dashboard
+        if ctx.args and len(ctx.args) > 0:
+            user_id = ctx.args[0]
+
+        if user_id:
+            await update.message.reply_text(
+                f"👋 Welcome to OptionBuddy Trading Agent!\n\n"
+                f"To complete setup, send: <code>/verify {user_id}</code>",
+                parse_mode="HTML"
+            )
+            log.info(f"User started bot with user_id: {user_id}")
+        else:
+            await update.message.reply_text(
+                "👋 Welcome to OptionBuddy Trading Agent!\n\n"
+                "Please complete registration at: https://yourserver.com/register\n"
+                "Then link your Telegram bot from the dashboard."
+            )
+
+    async def _cmd_verify(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /verify command — link Telegram chat_id to user_id."""
+        chat_id = update.effective_chat.id
+
+        if not ctx.args or len(ctx.args) < 1:
+            await update.message.reply_text(
+                "Usage: <code>/verify &lt;user_id&gt;</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        user_id = ctx.args[0]
+
+        try:
+            import requests
+            # Call web dashboard API to verify and link
+            # Note: This assumes the web service is running locally or accessible
+            web_host = os.getenv("WEB_HOST", "http://localhost:8000")
+            verify_url = f"{web_host}/verify-telegram"
+
+            response = requests.post(verify_url, json={
+                "user_id": user_id,
+                "chat_id": chat_id
+            })
+
+            if response.status_code == 200:
+                data = response.json()
+                await update.message.reply_text(
+                    "✅ Telegram linked successfully!\n\n"
+                    "Your OptionBuddy trading agent is now active."
+                )
+                log.info(f"Telegram verified for user {user_id} (chat_id: {chat_id})")
+            else:
+                await update.message.reply_text(
+                    f"❌ Verification failed: {response.json().get('message', 'Unknown error')}"
+                )
+                log.warning(f"Verification failed for user {user_id}")
+
+        except Exception as e:
+            log.error(f"Verification error: {e}")
+            await update.message.reply_text(
+                f"❌ Error verifying: {str(e)}\n\n"
+                "Please check your user ID and try again."
+            )
 
     async def _cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
