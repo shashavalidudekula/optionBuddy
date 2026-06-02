@@ -7,7 +7,7 @@ execution and NO broker linking — this bot is purely informational/advisory.
 Commands:
   /start       — subscribe to calls
   /stop        — pause receiving calls
-  /calls       — show currently active calls
+  /calls       — all active calls, grouped + full detail (filter: /calls futures|equity|commodity|options)
   /track       — show track record (accuracy / win rate)
   /categories  — toggle which call categories you receive
   /pnl         — (owner only) live INDStocks positions & today's P&L
@@ -451,6 +451,95 @@ def build_paper_report() -> str:
     return "\n".join(lines)
 
 
+# ── /calls — rich, grouped view of every active call (all categories) ──────────
+
+_CALL_STATUS_LABEL = {
+    "active": "🕒 waiting for entry",
+    "entry_triggered": "📍 in trade (entry hit)",
+    "target1_hit": "🎯 T1 booked, trailing",
+}
+
+# Friendly category arguments → canonical category.
+_CAT_ARG = {
+    "options": "index_option", "option": "index_option", "index": "index_option",
+    "index_option": "index_option", "nifty": "index_option",
+    "futures": "futures", "fut": "futures", "future": "futures",
+    "equity": "equity", "equities": "equity", "stocks": "equity", "stock": "equity",
+    "commodity": "commodity", "commodities": "commodity", "mcx": "commodity",
+}
+
+_CATEGORY_ORDER = ["index_option", "equity", "futures", "commodity"]
+
+
+def _call_block_html(c: dict, live) -> str:
+    action = str(c.get("action", "")).upper()
+    arrow = "🟢" if action == "BUY" else "🔴"
+    status = _CALL_STATUS_LABEL.get(str(c.get("status", "")), str(c.get("status", "")))
+
+    emin, emax = c.get("entry_min"), c.get("entry_max")
+    if emin not in (None, "") and emax not in (None, ""):
+        entry = f"₹{float(emin):,.2f} – ₹{float(emax):,.2f}"
+    else:
+        entry = f"₹{float(c.get('entry_price') or 0):,.2f}"
+
+    parts = [
+        f"{arrow} <b>{action} {html.escape(str(c.get('instrument', '?')))}</b>  ·  "
+        f"conf {c.get('confidence', 0)}%  ·  #{c.get('id')}",
+        f"   {status}" + (f"  ·  LTP ₹{float(live):,.2f}" if live is not None else ""),
+        f"   Entry: {entry}",
+    ]
+    tg = " / ".join(f"₹{float(t):,.2f}" for t in (c.get("target_1"), c.get("target_2")) if t is not None)
+    if tg:
+        parts.append(f"   🎯 {tg}")
+    if c.get("stop_loss") is not None:
+        parts.append(f"   🛑 ₹{float(c['stop_loss']):,.2f}")
+    if c.get("rationale"):
+        parts.append(f"   <i>{html.escape(str(c['rationale']))}</i>")
+    return "\n".join(parts)
+
+
+def build_calls_report(category: str | None = None) -> str:
+    """Rich, grouped view of active calls (optionally one category), with live LTP."""
+    from data.advisory_store import get_active_calls
+
+    calls = get_active_calls()
+    if category:
+        calls = [c for c in calls if c.get("category") == category]
+    if not calls:
+        scope = CATEGORY_LABEL.get(category, "").strip() if category else "active"
+        return f"ℹ️ <b>No {scope or 'active'} calls right now.</b> You'll be alerted on the next setup."
+
+    # Best-effort live prices (degrade silently if the data feed is unavailable).
+    price_of: dict = {}
+    try:
+        from core.indstocks_auth import IndStocksSession
+        from core.indstocks_data import make_price_lookup, _load_master
+        session = IndStocksSession()
+        _load_master(session)  # ensure scrip resolution works even before first gen
+        lookup = make_price_lookup(session)
+        for c in calls:
+            try:
+                price_of[c.get("id")] = lookup(c)
+            except Exception:  # noqa: BLE001
+                price_of[c.get("id")] = None
+    except Exception:  # noqa: BLE001
+        pass
+
+    title = "📋 <b>ACTIVE CALLS</b>"
+    if category:
+        title = f"📋 <b>ACTIVE CALLS — {CATEGORY_LABEL.get(category, category)}</b>"
+    lines = [title, "─" * 28]
+    for cat in _CATEGORY_ORDER:
+        group = [c for c in calls if c.get("category") == cat]
+        if not group:
+            continue
+        lines += ["", f"<b>{CATEGORY_LABEL.get(cat, cat)} ({len(group)})</b>"]
+        for c in group[:12]:
+            lines.append(_call_block_html(c, price_of.get(c.get("id"))))
+    lines += ["", DISCLAIMER_HTML]
+    return "\n".join(lines)
+
+
 class TelegramAdvisoryBot:
     """Advisory-only Telegram bot with subscriber management and call push."""
 
@@ -496,17 +585,22 @@ class TelegramAdvisoryBot:
         )
 
     async def _cmd_calls(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        active = get_active_calls()
-        if not active:
+        """All active calls, grouped by category with full details + live price.
+
+        Optional filter: /calls futures | equity | commodity | options
+        """
+        arg = (ctx.args[0].lower() if getattr(ctx, "args", None) else None)
+        category = _CAT_ARG.get(arg) if arg else None
+        if arg and category is None:
             await update.message.reply_text(
-                "No active calls right now. We'll alert you the moment a fresh setup appears."
+                "Filter not recognised. Try: <code>/calls</code>, <code>/calls futures</code>, "
+                "<code>/calls equity</code>, <code>/calls commodity</code> or "
+                "<code>/calls options</code>.",
+                parse_mode="HTML",
             )
             return
-        await update.message.reply_text(f"📋 *{len(active)} active call(s):*", parse_mode="Markdown")
-        for call in active[:10]:
-            await update.message.reply_text(
-                format_call(call, call["id"]), parse_mode="Markdown"
-            )
+        report = await asyncio.to_thread(build_calls_report, category)
+        await update.message.reply_text(report, parse_mode="HTML")
 
     async def _cmd_track(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         rec = get_track_record(days=30)
@@ -574,7 +668,8 @@ class TelegramAdvisoryBot:
             "*OptionBuddy Advisory — Help*\n\n"
             "We send research-backed trade calls with clear entry, target & stop-loss, "
             "then alert you when a target or stop-loss is hit.\n\n"
-            "• /calls — currently active calls\n"
+            "• /calls — all active calls (full detail + live price)\n"
+            "    ↳ filter: /calls futures · /calls equity · /calls commodity · /calls options\n"
             "• /track — accuracy & win rate\n"
             "• /categories — choose Index Options / Equity / Futures / Commodity\n"
             "• /pnl — your live positions & today's P&L (owner only)\n"
