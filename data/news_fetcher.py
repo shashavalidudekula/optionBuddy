@@ -97,8 +97,19 @@ def fetch_newsapi_headlines() -> list[str]:
         return []
 
 
+import time as _time
+_HEADLINES_TTL_SEC = 120
+_headlines_cache: tuple[list[str], float] | None = None
+
+
 def get_top_headlines(limit: int = 10) -> list[str]:
-    """Return up to `limit` relevant headlines from all sources, deduplicated."""
+    """Return up to `limit` relevant headlines from all sources, deduplicated.
+
+    Cached ~120s so event-driven generation doesn't refetch RSS every scan.
+    """
+    global _headlines_cache
+    if _headlines_cache and (_time.time() - _headlines_cache[1]) < _HEADLINES_TTL_SEC:
+        return _headlines_cache[0][:limit]
     all_headlines = fetch_rss_headlines() + fetch_newsapi_headlines()
     seen = set()
     unique = []
@@ -107,6 +118,8 @@ def get_top_headlines(limit: int = 10) -> list[str]:
         if norm not in seen:
             seen.add(norm)
             unique.append(h)
+    if unique:
+        _headlines_cache = (unique, _time.time())
     result = unique[:limit]
     log.info("Fetched %d relevant headlines", len(result))
     return result

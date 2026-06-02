@@ -19,17 +19,28 @@ import json
 import re
 from datetime import datetime
 
-from google import genai
-
-from config.settings import GEMINI_API_KEY, GEMINI_MODEL, MIN_CONFIDENCE
+from config.settings import MIN_CONFIDENCE
 from config.logger import get_logger
+from core.llm import generate, LLMError, LLMQuotaError
 
 log = get_logger("advisory_engine")
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
+# Back-compat: older modules import GeminiQuotaError from here.
+GeminiQuotaError = LLMQuotaError
 
 # Required numeric fields per category for a call to be considered valid/tradeable.
 _REQUIRED_FIELDS = ("instrument", "action", "entry_price", "target_1", "stop_loss")
+
+# Strike + option type, tolerant of separators (matches "NIFTY 23400 PE" and
+# "NIFTY-Jun2026-23400-PE"); used to normalise option instrument labels.
+_OPTION_RE = re.compile(r"(\d{3,7})[\s\-]*(CE|PE)\b", re.IGNORECASE)
+
+# Indices that must never be published as cash-equity calls (they're not tradeable
+# in the cash segment — they belong to index_option / futures).
+_INDEX_UNDERLYINGS = {
+    "NIFTY", "NIFTY50", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
+    "NIFTYNXT50", "SENSEX", "BANKEX", "SENSEX50",
+}
 
 _CATEGORY_GUIDANCE = {
     "index_option": (
@@ -43,9 +54,11 @@ _CATEGORY_GUIDANCE = {
         "is realistic and trackable. Do not invent premiums that contradict the chain."
     ),
     "equity": (
-        "Focus on liquid NSE cash stocks (large/mid cap). Recommend BUY or SELL with a cash "
-        "price entry, two targets and a stop-loss. Use technical structure (support/resistance, "
-        "breakouts, moving averages) plus the news context. Timeframe 'intraday' or 'swing'."
+        "Focus on liquid NSE cash stocks (large/mid cap), e.g. RELIANCE, HDFCBANK, TCS. Recommend "
+        "BUY or SELL with a cash price entry, two targets and a stop-loss. Use technical structure "
+        "(support/resistance, breakouts, moving averages) plus the news context. "
+        "NEVER use an index (NIFTY, BANKNIFTY, FINNIFTY, SENSEX, etc.) as an equity instrument — "
+        "indices belong to the index_option or futures categories. Timeframe 'intraday' or 'swing'."
     ),
     "futures": (
         "Focus on index futures (NIFTY/BANKNIFTY FUT) and liquid stock futures. Give a directional "
@@ -67,9 +80,10 @@ def _system_prompt(category: str) -> str:
         f"markets. Category: {category}.\n\n"
         f"{guidance}\n\n"
         "RULES:\n"
-        "1. Respond ONLY with a valid JSON ARRAY of call objects. No markdown, no prose.\n"
-        "2. Return 0 to 3 of your HIGHEST-CONVICTION ideas. Quality over quantity. "
-        "Return [] if nothing is compelling right now.\n"
+        '1. Respond ONLY with a valid JSON OBJECT of the form {"calls": [ ... ]}. '
+        "No markdown, no prose outside the JSON.\n"
+        "2. \"calls\" holds 0 to 3 of your HIGHEST-CONVICTION ideas. Quality over quantity. "
+        'Use {"calls": []} if nothing is compelling right now.\n'
         "3. Each call object MUST have these keys:\n"
         '   "instrument" (e.g. "NIFTY 24500 CE" or "RELIANCE"),\n'
         '   "underlying" (e.g. "NIFTY", "RELIANCE", "GOLD"),\n'
@@ -83,6 +97,12 @@ def _system_prompt(category: str) -> str:
         "5. Prices must be internally consistent: for BUY, target>entry>stop; "
         "for SELL, target<entry<stop.\n"
         "6. Be precise with numbers — these are published as advisory calls.\n"
+        "7. GROUND every view in the data provided. The 'technicals' block is DAILY structure "
+        "(RSI, EMA20/EMA50, 'trend', ATR14 for ~1-2x ATR stops, 20-day range). The 'intraday' "
+        "block is the LIVE 5-minute read for TIMING: rsi14_5m, ema9_5m/ema21_5m and 'trend_5m', "
+        "'vwap_state' (above/below VWAP), 'opening_range_state' and 'momentum_30m_pct'. Align the "
+        "trade with intraday momentum and only fade it with a clear reason. Do NOT invent indicator "
+        'values or cite TA you were not given. If nothing is high-conviction, use {"calls": []}.\n'
     )
 
 
@@ -93,30 +113,28 @@ def _build_market_prompt(market_data: dict, headlines: list[str]) -> str:
         "## Live Market Snapshot\n" + mkt +
         "\n\n## Recent Headlines / Macro\n" + news +
         f"\n\n## Time: {datetime.now().strftime('%Y-%m-%d %H:%M IST')}\n\n"
-        "Generate your highest-conviction calls now. JSON array only."
+        'Generate your highest-conviction calls now. JSON object {"calls": [...]} only.'
     )
 
 
 def _parse_calls(raw: str) -> list[dict]:
-    """Extract a JSON array of calls from the model response."""
-    raw = raw.strip()
-    # Strip code fences if present
-    fence = re.search(r"```(?:json)?\s*(\[.*\])\s*```", raw, re.DOTALL)
+    """Extract the list of calls from the model response (JSON-mode or fenced)."""
+    raw = (raw or "").strip()
+    # In case a provider still wraps the JSON in a code fence, strip it.
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
     if fence:
-        raw = fence.group(1)
-    else:
-        # Fall back to the first [...] block
-        arr = re.search(r"(\[.*\])", raw, re.DOTALL)
-        if arr:
-            raw = arr.group(1)
+        raw = fence.group(1).strip()
     try:
         data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        return data if isinstance(data, list) else []
     except json.JSONDecodeError as e:
         log.error("Failed to parse calls JSON: %s | raw: %s", e, raw[:300])
         return []
+    if isinstance(data, dict):
+        calls = data.get("calls")
+        if isinstance(calls, list):
+            return calls
+        return [data]  # a single bare call object
+    return data if isinstance(data, list) else []
 
 
 def _is_valid(call: dict) -> bool:
@@ -161,25 +179,39 @@ def generate_calls(
         the `category` key set and is ready to pass to save_call().
     """
     exclude = exclude_instruments or set()
-    prompt = _system_prompt(category) + "\n\n" + _build_market_prompt(market_data, headlines)
+    system = _system_prompt(category)
+    user = _build_market_prompt(market_data, headlines)
 
     try:
-        response = _client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=genai.types.GenerateContentConfig(
-                max_output_tokens=1024,
-                temperature=0.3,
-            ),
-        )
-        raw_calls = _parse_calls(response.text)
-    except Exception as e:
+        text = generate(user, system=system, json_mode=True, max_tokens=1024, temperature=0.3)
+        raw_calls = _parse_calls(text)
+    except LLMQuotaError as e:
+        log.warning("Call generation skipped for %s (quota): %s", category, e)
+        return []
+    except LLMError as e:
         log.error("Call generation failed for %s: %s", category, e)
         return []
 
     published: list[dict] = []
     for call in raw_calls:
         call["category"] = category
+
+        # Normalise option labels to "<UNDERLYING> <STRIKE> <CE/PE>" so they display
+        # cleanly and the tracker can resolve them (the model often echoes the raw
+        # trading symbol like "NIFTY-Jun2026-23400-PE").
+        if category == "index_option":
+            m = _OPTION_RE.search(str(call.get("instrument", "")))
+            undl = str(call.get("underlying", "")).upper().strip()
+            if m and undl:
+                call["instrument"] = f"{undl} {int(m.group(1))} {m.group(2).upper()}"
+
+        # An index can't be a cash-equity trade; reject so we don't publish
+        # untradeable "SELL NIFTY (equity)" ideas. Indices → options/futures.
+        if category == "equity":
+            undl = str(call.get("underlying", "")).upper().replace(" ", "")
+            if undl in _INDEX_UNDERLYINGS:
+                log.info("Rejecting index underlying in equity category: %s", call.get("instrument"))
+                continue
 
         if not _is_valid(call):
             continue

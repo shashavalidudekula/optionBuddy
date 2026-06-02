@@ -30,9 +30,10 @@ from core.market_data import fetch_global_data
 
 log = get_logger("indstocks_data")
 
-# Quote API allows up to 1000 scrip-codes per request; stay well under.
-_LTP_BATCH = 500
-_PRICE_TTL_SEC = 45          # cache window for repeated lookups in one pass
+# The LTP endpoint 400s once the request URL gets too long (~470 codes blew it),
+# so keep batches small; ATM-trimmed option requests are far under this anyway.
+_LTP_BATCH = 50
+_PRICE_TTL_SEC = 4           # short: shares a price within one ~5s poll, fresh next poll
 _INSTRUMENTS_TTL_SEC = 6 * 3600  # refresh the master a few times a day
 
 # Index symbol → name as it (most likely) appears in the index master SYMBOL_NAME.
@@ -115,12 +116,31 @@ def _parse_expiry(s: str) -> date | None:
     s = (s or "").strip()
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%Y/%m/%d", "%d-%b-%y", "%d%b%Y"):
+    # INDstocks F&O master uses "MM/DD/YYYY HH:MM"; keep the older formats too.
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%Y/%m/%d", "%d-%b-%y", "%d%b%Y",
+                "%m/%d/%Y %H:%M", "%m/%d/%Y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
     return None
+
+
+def _fno_underlying(row: dict) -> str:
+    """Underlying ticker for an F&O row.
+
+    NSE F&O rows leave SYMBOL_NAME blank and encode the underlying as the prefix
+    of TRADING_SYMBOL, e.g. 'NIFTY-Jun2026-23000-PE' → 'NIFTY',
+    'BANKNIFTY-Jun2026-FUT' → 'BANKNIFTY'. CUSTOM_SYMBOL ('NIFTY 30 JUN ...') is a
+    fallback; SYMBOL_NAME (used by some BSE rows) is the last resort.
+    """
+    ts = (row.get("TRADING_SYMBOL") or "").strip()
+    if "-" in ts:
+        return ts.split("-", 1)[0].upper()
+    cs = (row.get("CUSTOM_SYMBOL") or "").strip()
+    if cs:
+        return cs.split(" ", 1)[0].upper()
+    return (row.get("SYMBOL_NAME") or "").upper()
 
 
 def _nearest_expiry(rows: list[dict], today: date) -> str | None:
@@ -149,9 +169,13 @@ def _equity_scrip(underlying: str) -> str | None:
 def _index_scrip(underlying: str) -> str | None:
     aliases = _INDEX_ALIASES.get(underlying.upper().strip(), (underlying.upper().strip(),))
     for r in _master.get("index", []):
-        name = r.get("SYMBOL_NAME", "").upper()
-        sym = r.get("TRADING_SYMBOL", "").upper()
-        if name in aliases or sym in aliases:
+        # The index master only has EXCH/SECURITY_ID/SEGMENT — the index NAME is in
+        # SEGMENT (e.g. "NIFTY 50", "BANK NIFTY", "India VIX"). Keep SYMBOL_NAME/
+        # TRADING_SYMBOL as fallbacks in case the feed shape changes.
+        seg = (r.get("SEGMENT") or "").upper()
+        name = (r.get("SYMBOL_NAME") or "").upper()
+        sym = (r.get("TRADING_SYMBOL") or "").upper()
+        if seg in aliases or name in aliases or sym in aliases:
             return _scrip_code(r)
     return None
 
@@ -160,8 +184,8 @@ def _future_scrip(underlying: str) -> str | None:
     u = underlying.upper().strip()
     rows = [
         r for r in _master.get("fno", [])
-        if r.get("SYMBOL_NAME", "").upper() == u
-        and "FUT" in r.get("INSTRUMENT_NAME", "").upper()
+        if _fno_underlying(r) == u
+        and "FUT" in (r.get("INSTRUMENT_NAME") or "").upper()
     ]
     if not rows:
         return None
@@ -177,7 +201,7 @@ def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | N
     ot = opt_type.upper().strip()
     rows = [
         r for r in _master.get("fno", [])
-        if r.get("SYMBOL_NAME", "").upper() == u
+        if _fno_underlying(r) == u
         and r.get("OPTION_TYPE", "").upper() == ot
     ]
     if not rows:
@@ -196,7 +220,10 @@ def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | N
     return _scrip_code(candidates[0]) if candidates else None
 
 
-_OPTION_RE = re.compile(r"(\d{3,7})\s*(CE|PE)\b", re.IGNORECASE)
+# Strike + option type, tolerant of separators so both "NIFTY 23400 PE" and the
+# trading-symbol form "NIFTY-Jun2026-23400-PE" resolve (the year 2026 won't match
+# because it isn't immediately followed by CE/PE).
+_OPTION_RE = re.compile(r"(\d{3,7})[\s\-]*(CE|PE)\b", re.IGNORECASE)
 
 
 def resolve_scrip_for_call(call: dict) -> str | None:
@@ -278,8 +305,35 @@ def get_market_snapshot(session) -> dict:
     except Exception as e:
         log.warning("Global data fetch failed: %s", e)
 
+    # Technical grounding so the model reasons over real indicators, not just a
+    # single live price point: daily structure + live intraday (5-min) context.
+    try:
+        from core.technicals import get_technicals, get_intraday_technicals
+        tech = get_technicals(["NIFTY", "BANKNIFTY"])
+        if tech:
+            snap["technicals"] = tech
+        intraday = get_intraday_technicals(["NIFTY", "BANKNIFTY"])
+        if intraday:
+            snap["intraday"] = intraday
+    except Exception as e:
+        log.warning("Technicals fetch failed: %s", e)
+
     log.debug("Advisory market snapshot: %s", snap)
     return snap
+
+
+def get_index_spots(session) -> dict[str, float]:
+    """Cheap live spot for NIFTY / BANKNIFTY / INDIA VIX (for generation triggers)."""
+    _load_master(session)
+    codes = {}
+    for key in ("NIFTY", "BANKNIFTY", "INDIAVIX"):
+        c = _index_scrip(key)
+        if c:
+            codes[key.lower()] = c
+    if not codes:
+        return {}
+    prices = get_ltp(session, list(codes.values()))
+    return {label: prices[c] for label, c in codes.items() if c in prices}
 
 
 def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
@@ -291,7 +345,7 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
     _load_master(session)
     u = underlying.upper().strip()
     rows = [r for r in _master.get("fno", [])
-            if r.get("SYMBOL_NAME", "").upper() == u and r.get("OPTION_TYPE", "").upper() in ("CE", "PE")]
+            if _fno_underlying(r) == u and r.get("OPTION_TYPE", "").upper() in ("CE", "PE")]
     if not rows:
         return []
 
@@ -332,6 +386,33 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
         })
     chain.sort(key=lambda c: (c["strike"], c["option_type"]))
     return chain
+
+
+def get_lot_size(session, underlying: str) -> int | None:
+    """Lot size (LOT_UNITS) for an F&O underlying from the master; None if unknown.
+
+    Falls back to PAPER_LOT_SIZES when the master can't be loaded so the paper
+    trader still works without a live session.
+    """
+    from config.settings import PAPER_LOT_SIZES
+
+    u = underlying.upper().strip()
+    try:
+        _load_master(session)
+        for r in _master.get("fno", []):
+            if _fno_underlying(r) == u:
+                lot = r.get("LOT_UNITS") or r.get("LOT_SIZE")
+                if lot:
+                    try:
+                        val = int(float(lot))
+                        if val > 0:
+                            return val
+                    except (TypeError, ValueError):
+                        pass
+                break
+    except Exception as e:  # noqa: BLE001
+        log.warning("Lot-size master lookup failed for %s: %s", u, e)
+    return PAPER_LOT_SIZES.get(u)
 
 
 def make_price_lookup(session):

@@ -5,26 +5,32 @@ Advisory-only: it researches the market, publishes trade-idea "calls" (entry,
 target(s), stop-loss + rationale) and tracks each call's lifecycle, pushing
 Telegram alerts to subscribers. There is NO order execution and NO broker link.
 
-Loop responsibilities:
+Loop responsibilities (fast loop every POLL_INTERVAL_SEC, ~5s):
   • Startup       — init advisory DB, start the Telegram bot polling.
-  • Generation    — every GENERATION_INTERVAL_MIN during market hours, ask the
-                    AI engine for fresh high-conviction calls per category,
-                    persist them and push to category subscribers.
   • Tracking      — every poll, evaluate active calls against live prices and
-                    push entry/target/SL/expiry events.
-  • Briefing      — once each trading morning, broadcast a "good morning" note
-                    with the 30-day track record.
+                    push entry/target/SL/expiry events (this is the near-real-time
+                    layer: it fires the instant a premium hits its entry/exit level).
+  • Option gen    — EVENT-DRIVEN: re-scan index options the moment the market moves
+                    (index % move, new ATM strike, VIX jump) or at least every
+                    OPT_GEN_FLOOR_SEC, with an OPT_GEN_MIN_GAP_SEC cooldown.
+  • Other gen     — equity/futures/commodity on a slower OTHER_GEN_INTERVAL_MIN timer.
+  • Briefing      — once each trading morning, broadcast a "good morning" note.
   • EOD summary   — once after close, broadcast the day's track-record digest.
 
-All heavy/blocking work (Gemini, yfinance, news, DB) runs in worker threads so
-the Telegram event loop stays responsive.
+All heavy/blocking work (LLM, yfinance, news, DB) runs in worker threads so the
+Telegram event loop stays responsive.
 """
 
 import asyncio
+import time
 from datetime import datetime, time as dtime
 
 from config.logger import get_logger
-from config.settings import POLL_INTERVAL_SEC, MARKET_OPEN, MARKET_CLOSE
+from config.settings import (
+    POLL_INTERVAL_SEC, MARKET_OPEN, MARKET_CLOSE, PAPER_TRADING_ENABLED,
+    OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
+    OTHER_GEN_INTERVAL_MIN, ATM_STEP,
+)
 from data.advisory_store import (
     CATEGORIES,
     init_advisory_db,
@@ -35,8 +41,11 @@ from data.advisory_store import (
 )
 from signals.advisory_engine import generate_calls
 from core.call_tracker import track_active_calls
+from core.paper_trader import PaperTrader
 from core.indstocks_auth import get_session
-from core.indstocks_data import get_market_snapshot, make_price_lookup, get_option_chain
+from core.indstocks_data import (
+    get_market_snapshot, make_price_lookup, get_option_chain, get_index_spots,
+)
 from data.news_fetcher import get_top_headlines
 from notifier.telegram_advisory_bot import (
     TelegramAdvisoryBot,
@@ -46,8 +55,6 @@ from notifier.telegram_advisory_bot import (
 
 log = get_logger("advisory_main")
 
-# How often to scan the market for fresh calls (minutes).
-GENERATION_INTERVAL_MIN = 30
 # Don't start broadcasting the morning briefing before this time.
 BRIEFING_AFTER = dtime(8, 30)
 # Run the EOD digest after the market closes.
@@ -73,14 +80,14 @@ def _in_market_hours(now: datetime) -> bool:
 
 # ── Work units (sync, run in threads) ─────────────────────────────────────────
 
-def _generate_all_categories(session) -> list[tuple[dict, int]]:
-    """Generate + persist fresh calls across all categories. Returns (call, id)."""
+def _generate_all_categories(session, categories) -> list[tuple[dict, int]]:
+    """Generate + persist fresh calls for the given categories. Returns (call, id)."""
     headlines = get_top_headlines()
     market = get_market_snapshot(session)
     exclude = active_instruments()
 
     saved: list[tuple[dict, int]] = []
-    for cat in CATEGORIES:
+    for cat in categories:
         cat_market = market
         if cat == "index_option" and session is not None:
             # Ground option calls in real, tradeable premiums (nearest expiry, ATM±N).
@@ -112,19 +119,81 @@ def _generate_all_categories(session) -> list[tuple[dict, int]]:
 
 # ── Async cycles ──────────────────────────────────────────────────────────────
 
-async def run_generation_cycle(bot: TelegramAdvisoryBot, session) -> None:
-    saved = await asyncio.to_thread(_generate_all_categories, session)
+async def run_generation_cycle(bot: TelegramAdvisoryBot, session, categories) -> None:
+    saved = await asyncio.to_thread(_generate_all_categories, session, categories)
     for call, call_id in saved:
         await bot.push_new_call(call, call_id)
-    log.info("Generation cycle published %s call(s)", len(saved))
+    if saved:
+        log.info("Generation (%s) published %s call(s)", ",".join(categories), len(saved))
 
 
-async def run_tracking_pass(bot: TelegramAdvisoryBot, price_lookup) -> None:
+class OptionGenTrigger:
+    """Decides when to re-scan index options — on real market moves, not a timer.
+
+    Fires when an index moves >= GEN_MOVE_PCT, crosses into a new ATM strike, or
+    India VIX jumps >= GEN_VIX_JUMP_PCT since the last scan; plus a floor so we
+    scan at least every OPT_GEN_FLOOR_SEC, and a cooldown so we never scan more
+    often than OPT_GEN_MIN_GAP_SEC.
+    """
+
+    def __init__(self):
+        self.last_gen = 0.0
+        self.ref_spot: dict[str, float] = {}
+        self.ref_atm: dict[str, float] = {}
+        self.ref_vix: float | None = None
+
+    @staticmethod
+    def _atm(index: str, spot: float | None) -> float | None:
+        step = ATM_STEP.get(index)
+        if not step or not spot:
+            return None
+        return round(spot / step) * step
+
+    def check(self, spots: dict) -> tuple[bool, str]:
+        now = time.time()
+        if now - self.last_gen < OPT_GEN_MIN_GAP_SEC:
+            return False, ""
+        if not self.ref_spot:
+            return True, "init"
+
+        reasons: list[str] = []
+        if now - self.last_gen >= OPT_GEN_FLOOR_SEC:
+            reasons.append("floor")
+        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY")):
+            cur, ref = spots.get(lbl), self.ref_spot.get(lbl)
+            if cur and ref and abs(cur - ref) / ref * 100 >= GEN_MOVE_PCT:
+                reasons.append(f"{idx} {(cur - ref) / ref * 100:+.2f}%")
+            atm, ratm = self._atm(idx, cur), self.ref_atm.get(lbl)
+            if atm and ratm and atm != ratm:
+                reasons.append(f"{idx} ATM→{int(atm)}")
+        vix = spots.get("indiavix")
+        if vix and self.ref_vix and abs(vix - self.ref_vix) / self.ref_vix * 100 >= GEN_VIX_JUMP_PCT:
+            reasons.append(f"VIX {(vix - self.ref_vix) / self.ref_vix * 100:+.1f}%")
+        return (bool(reasons), ", ".join(reasons))
+
+    def commit(self, spots: dict) -> None:
+        self.last_gen = time.time()
+        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY")):
+            if spots.get(lbl):
+                self.ref_spot[lbl] = spots[lbl]
+                self.ref_atm[lbl] = self._atm(idx, spots[lbl])
+        if spots.get("indiavix"):
+            self.ref_vix = spots["indiavix"]
+
+
+async def run_tracking_pass(bot: TelegramAdvisoryBot, price_lookup, paper: PaperTrader | None) -> None:
     events = await asyncio.to_thread(track_active_calls, price_lookup)
     for evt in events:
         await bot.push_call_event(evt)
     if events:
         log.info("Tracking pass emitted %s event(s)", len(events))
+
+    # Shadow/paper trading reacts to the same lifecycle events (zero real money).
+    if paper is not None:
+        await asyncio.to_thread(paper.mark_to_market, price_lookup)
+        notes = await asyncio.to_thread(paper.process_events, events)
+        for note in notes:
+            await bot.notify_owner(note)
 
 
 def _track_record_lines(title: str) -> list[str]:
@@ -193,12 +262,21 @@ async def run() -> None:
 
     price_lookup = make_price_lookup(session)
 
-    last_gen: datetime | None = None
+    paper: PaperTrader | None = None
+    if PAPER_TRADING_ENABLED:
+        try:
+            paper = PaperTrader(session)
+        except Exception as e:
+            log.error("Paper trader init failed (%s); continuing without it.", e)
+
+    opt_trigger = OptionGenTrigger()
+    other_categories = [c for c in CATEGORIES if c != "index_option"]
+    last_other_gen: datetime | None = None
     briefing_date = None
     eod_date = None
 
-    log.info("Advisory orchestrator started (poll=%ss, gen=%smin)",
-             POLL_INTERVAL_SEC, GENERATION_INTERVAL_MIN)
+    log.info("Advisory orchestrator started (poll=%ss, options=event-driven, others=%smin)",
+             POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN)
 
     try:
         while True:
@@ -215,20 +293,33 @@ async def run() -> None:
                 briefing_date = today
 
             if _in_market_hours(now):
-                # Fresh-call generation on its own cadence.
-                if (last_gen is None
-                        or (now - last_gen).total_seconds() >= GENERATION_INTERVAL_MIN * 60):
-                    try:
-                        await run_generation_cycle(bot, session)
-                    except Exception as e:
-                        log.error("Generation cycle failed: %s", e)
-                    last_gen = now
-
-                # Lifecycle tracking every poll.
+                # 1) Lifecycle tracking every poll — the near-real-time entry/exit layer.
                 try:
-                    await run_tracking_pass(bot, price_lookup)
+                    await run_tracking_pass(bot, price_lookup, paper)
                 except Exception as e:
                     log.error("Tracking pass failed: %s", e)
+
+                # 2) Event-driven index-option generation — fire when the market moves.
+                if session is not None:
+                    try:
+                        spots = await asyncio.to_thread(get_index_spots, session)
+                        fire, reason = opt_trigger.check(spots)
+                        if fire:
+                            log.info("Option scan triggered (%s)", reason or "—")
+                            await run_generation_cycle(bot, session, ["index_option"])
+                            opt_trigger.commit(spots)
+                    except Exception as e:
+                        log.error("Option generation failed: %s", e)
+
+                # 3) Slower cadence for equity/futures/commodity.
+                if other_categories and (
+                        last_other_gen is None
+                        or (now - last_other_gen).total_seconds() >= OTHER_GEN_INTERVAL_MIN * 60):
+                    try:
+                        await run_generation_cycle(bot, session, other_categories)
+                    except Exception as e:
+                        log.error("Other-category generation failed: %s", e)
+                    last_other_gen = now
 
             # EOD digest — once per trading day, after close.
             if (_is_weekday(now) and now.time() >= EOD_AFTER and eod_date != today):

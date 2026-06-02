@@ -1,5 +1,6 @@
 requests>=2.32.0
 google-genai>=0.1.0
+openai>=1.40.0
 python-telegram-bot>=21.0
 yfinance>=0.2.40
 feedparser>=6.0.11

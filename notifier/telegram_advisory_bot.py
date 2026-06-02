@@ -10,6 +10,9 @@ Commands:
   /calls       — show currently active calls
   /track       — show track record (accuracy / win rate)
   /categories  — toggle which call categories you receive
+  /pnl         — (owner only) live INDStocks positions & today's P&L
+  /review      — (owner only) AI next-session plan for your open positions
+  /paper       — (owner only) shadow/paper account performance (no real money)
   /help        — usage help
 
 Push API (called by the main advisory loop):
@@ -17,6 +20,9 @@ Push API (called by the main advisory loop):
   push_call_event(event)         — broadcast a target/SL/expiry update
   broadcast(text)                — broadcast plain message to all active subscribers
 """
+
+import asyncio
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,7 +32,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config.settings import TELEGRAM_BOT_TOKEN
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from config.logger import get_logger
 from data.advisory_store import (
     CATEGORIES,
@@ -45,6 +51,19 @@ log = get_logger("advisory_bot")
 DISCLAIMER = (
     "⚠️ _Advisory only — not investment advice. Markets carry risk; "
     "trade at your own discretion._"
+)
+
+# HTML variant for messages sent with parse_mode="HTML" (/pnl, /review).
+DISCLAIMER_HTML = (
+    "⚠️ <i>Advisory only — not investment advice. Markets carry risk; "
+    "trade at your own discretion.</i>"
+)
+
+_TOKEN_EXPIRED_MSG = (
+    "⚠️ <b>INDStocks token expired or invalid.</b>\n"
+    "Refresh <code>INDSTOCKS_ACCESS_TOKEN</code> in <code>.env</code>, recreate the "
+    "container (<code>docker compose up -d</code>), then try again.\n"
+    "<i>Note: INDStocks tokens expire roughly daily (~07:00 IST).</i>"
 )
 
 CATEGORY_LABEL = {
@@ -119,6 +138,319 @@ def format_event(event: dict) -> str:
     return "\n".join(parts)
 
 
+# ── /pnl & /review — live portfolio view (read-only, owner only) ───────────────
+
+class IndStocksAuthError(Exception):
+    """Raised when the INDStocks token is expired/invalid (HTTP 401)."""
+
+
+def _first(d: dict, *keys, default=None):
+    """Return the first present, non-empty value among keys (API field aliases)."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return default
+
+
+def _num(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_open_closed() -> tuple[list[dict], list[dict]]:
+    """Fetch live positions from INDStocks → (open, closed) normalized dicts.
+
+    Read-only portfolio view — NO execution. Builds a fresh session each call so
+    it always uses the current token (INDStocks tokens expire ~daily). Raises
+    IndStocksAuthError on HTTP 401 (expired/invalid token); other failures
+    propagate to the caller.
+    """
+    import requests
+    from core.indstocks_auth import IndStocksSession
+
+    try:
+        session = IndStocksSession()
+        resp = session.get(
+            "/portfolio/positions",
+            params={"segment": "derivative", "product": "margin"},
+        )
+    except requests.HTTPError as e:
+        if getattr(e.response, "status_code", None) == 401:
+            raise IndStocksAuthError() from e
+        raise
+
+    # Unwrap the response envelope ({"data": {...|[...]}} or a bare list).
+    if isinstance(resp, list):
+        positions = resp
+    else:
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        if isinstance(data, dict):
+            positions = data.get("net_positions", data.get("positions", []))
+        elif isinstance(data, list):
+            positions = data
+        else:
+            positions = []
+
+    open_pos: list[dict] = []
+    closed_pos: list[dict] = []
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        qty = int(_num(_first(p, "net_qty", "net_quantity", default=0)))
+        sym = _first(p, "symbol", "trading_symbol", "custom_symbol", default="?")
+        strike = _first(p, "drv_strike_price", "strike_price")
+        opt = _first(p, "drv_option_type", "option_type")
+        label = f"{sym}{strike}{opt}" if strike and opt else sym
+
+        if qty != 0:
+            upnl_raw = _first(p, "pnl_absolute", "unrealized_profit", "unrealised")
+            open_pos.append({
+                "label": label,
+                "direction": "LONG" if qty > 0 else "SHORT",
+                "qty": abs(qty),
+                "avg_price": _num(_first(p, "avg_price", "buy_avg", "net_avg_price")),
+                "ltp": _num(_first(p, "ltp", "last_price", "live_price", "last_traded_price")),
+                "unrealised": _num(upnl_raw) if upnl_raw is not None else None,
+            })
+        else:
+            closed_pos.append({
+                "label": label,
+                "buy_avg": _num(_first(p, "buy_avg")),
+                "sell_avg": _num(_first(p, "sell_avg")),
+                "realised": _num(_first(p, "realized_profit", "realised_profit", "realized")),
+            })
+    return open_pos, closed_pos
+
+
+def build_pnl_report() -> str:
+    """Render the owner's live positions & today's P&L as an HTML table."""
+    try:
+        open_pos, closed_pos = _fetch_open_closed()
+    except IndStocksAuthError:
+        return _TOKEN_EXPIRED_MSG
+    except Exception as e:  # noqa: BLE001
+        log.error("PnL fetch failed: %s", e)
+        return f"⚠️ <b>Couldn't fetch positions:</b> {e}"
+
+    if not open_pos and not closed_pos:
+        return "ℹ️ <b>No open positions or trades today.</b>"
+
+    lines: list[str] = []
+    if open_pos:
+        lines.append("<b>⏳ OPEN POSITIONS</b>")
+        lines.append("─" * 28)
+        unreal_total = 0.0
+        has_unreal = False
+        for p in open_pos:
+            emoji = "📈" if p["direction"] == "LONG" else "📉"
+            lines.append(f"{emoji} <b>{p['label']}</b>  {p['direction']} ×{p['qty']}")
+            sub = f"   Avg ₹{p['avg_price']:,.2f}"
+            if p["ltp"]:
+                sub += f" | LTP ₹{p['ltp']:,.2f}"
+            if p["unrealised"] is not None:
+                unreal_total += p["unrealised"]
+                has_unreal = True
+                sub += f" | {'🟢' if p['unrealised'] >= 0 else '🔴'} ₹{p['unrealised']:,.0f}"
+            lines.append(sub)
+        if has_unreal:
+            lines.append(f"<b>Unrealised: {'🟢' if unreal_total >= 0 else '🔴'} ₹{unreal_total:,.2f}</b>")
+        lines.append("")
+
+    if closed_pos:
+        lines.append("<b>📊 TODAY'S CLOSED TRADES</b>")
+        lines.append("─" * 28)
+        realized_total = 0.0
+        for p in closed_pos:
+            realized_total += p["realised"]
+            lines.append(f"{p['label']}  →  ₹{p['realised']:,.0f} {'✅' if p['realised'] >= 0 else '❌'}")
+            lines.append(f"   Buy ₹{p['buy_avg']:,.2f} | Sell ₹{p['sell_avg']:,.2f}")
+        lines.append(f"<b>Realised P&amp;L: {'🟢' if realized_total >= 0 else '🔴'} ₹{realized_total:,.2f}</b>")
+
+    return "\n".join(lines).rstrip()
+
+
+# AI action → emoji for the /review next-session plan.
+_ACTION_EMOJI = {
+    "HOLD": "✊",
+    "EXIT": "🚪",
+    "BOOK_PARTIAL": "💰",
+    "ADD": "➕",
+    "HEDGE": "🛡",
+}
+
+
+def build_position_review() -> str:
+    """Fetch open positions + market context, ask Gemini for a next-session plan."""
+    import html
+
+    from core.indstocks_auth import IndStocksSession
+    from core.indstocks_data import get_market_snapshot
+    from data.news_fetcher import get_top_headlines
+    from core.llm import LLMQuotaError
+    from signals.position_advisor import review_positions
+
+    try:
+        open_pos, _ = _fetch_open_closed()
+    except IndStocksAuthError:
+        return _TOKEN_EXPIRED_MSG
+    except Exception as e:  # noqa: BLE001
+        log.error("Review fetch failed: %s", e)
+        return f"⚠️ <b>Couldn't fetch positions:</b> {html.escape(str(e))}"
+
+    if not open_pos:
+        return "ℹ️ <b>No open positions to review.</b>"
+
+    # Market context is best-effort — the review still works on positions alone.
+    try:
+        market = get_market_snapshot(IndStocksSession())
+    except Exception as e:  # noqa: BLE001
+        log.warning("Review market snapshot failed: %s", e)
+        market = {}
+    try:
+        headlines = get_top_headlines()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Review headlines failed: %s", e)
+        headlines = []
+
+    try:
+        review = review_positions(open_pos, market, headlines)
+    except LLMQuotaError:
+        return (
+            "🤖 <b>AI review unavailable — model quota/rate limit reached.</b>\n"
+            "Please try again in a little while."
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("Position review failed: %s", e)
+        return f"⚠️ <b>AI review failed:</b> {html.escape(str(e))}"
+
+    items = review.get("positions", [])
+    if not items:
+        return "🤖 <b>AI couldn't form a clear view right now.</b> Try again shortly."
+
+    lines = ["🤖 <b>NEXT-SESSION PLAN</b>", "─" * 28]
+    for it in items:
+        label = html.escape(str(it.get("instrument", "?")))
+        action = str(it.get("action", "HOLD")).upper()
+        emoji = _ACTION_EMOJI.get(action, "•")
+        head = f"{emoji} <b>{label}</b> — {action.replace('_', ' ')}"
+        conf = it.get("confidence")
+        if conf not in (None, ""):
+            head += f"  ({_num(conf):.0f}%)"
+        lines.append(head)
+
+        levels = []
+        if it.get("target") not in (None, ""):
+            levels.append(f"🎯 ₹{_num(it['target']):,.2f}")
+        if it.get("stop_loss") not in (None, ""):
+            levels.append(f"🛑 ₹{_num(it['stop_loss']):,.2f}")
+        if levels:
+            lines.append("   " + "  ".join(levels))
+
+        reason = it.get("reason")
+        if reason:
+            lines.append(f"   <i>{html.escape(str(reason))}</i>")
+
+    overall = review.get("overall")
+    if overall:
+        lines += ["", f"<b>Overall:</b> {html.escape(str(overall))}"]
+    lines += ["", DISCLAIMER_HTML]
+    return "\n".join(lines)
+
+
+# ── /paper — simulated (shadow) account performance (owner only) ───────────────
+
+def _paper_trade_table(rows: list[dict]) -> str:
+    """Build a monospaced, column-aligned ledger of closed paper trades.
+
+    Telegram bot messages can't render true text colours, so profit/loss is
+    flagged with a trailing 🟢/🔴 (kept last so column alignment is preserved)
+    and every P&L carries an explicit +/− sign.
+    """
+    header = f"{'Date':<5} {'Instrument':<15} {'Side':<4} {'Entry':>8} {'Exit':>8} {'P&L':>9}"
+    out = [header]
+    for p in rows:
+        closed_at = p.get("closed_at")
+        d = closed_at.strftime("%m/%d") if closed_at else "  -  "
+        instr = str(p["instrument"])[:15]
+        side = str(p["action"]).upper()[:4]
+        entry = float(p["entry_price"])
+        exit_p = float(p["last_price"]) if p["last_price"] is not None else entry
+        pnl = float(p["realized_pnl"])
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        out.append(
+            f"{d:<5} {instr:<15} {side:<4} {entry:>8.2f} {exit_p:>8.2f} "
+            f"{pnl:>+9,.0f}  {emoji}"
+        )
+    return "<pre>" + html.escape("\n".join(out)) + "</pre>"
+
+
+def build_paper_report() -> str:
+    """Render the paper (shadow) account: equity, returns, P&L, win rate, positions."""
+    from data.advisory_store import (
+        get_paper_stats,
+        get_open_paper_positions,
+        get_closed_paper_positions,
+        get_call_levels,
+    )
+
+    s = get_paper_stats()
+    if not s:
+        return "ℹ️ <b>Paper account not initialised yet.</b> It starts once the agent runs."
+
+    total_emoji = "🟢" if s["total_return_pct"] >= 0 else "🔴"
+    today_emoji = "🟢" if s["today_realized"] >= 0 else "🔴"
+    lines = [
+        "🧪 <b>PAPER ACCOUNT</b> <i>(shadow — no real money)</i>",
+        "─" * 28,
+        f"Equity: <b>₹{s['equity']:,.0f}</b>  {total_emoji} {s['total_return_pct']:+.2f}%",
+        f"Start: ₹{s['starting_capital']:,.0f}  |  Cash: ₹{s['cash']:,.0f}",
+        f"Realised: ₹{s['realized_pnl']:,.0f}  |  Unrealised: ₹{s['unrealized_pnl']:,.0f}",
+        f"Today: {today_emoji} ₹{s['today_realized']:,.0f}",
+        "",
+        f"Closed trades: <b>{s['closed_trades']}</b>  "
+        f"(W {s['wins']} / L {s['losses']}, win rate <b>{s['win_rate']}%</b>)",
+        f"Max drawdown: {s['max_drawdown_pct']:.2f}%",
+    ]
+
+    open_pos = get_open_paper_positions()
+    if open_pos:
+        levels = get_call_levels([p.get("call_id") for p in open_pos])
+        lines += ["", f"<b>⏳ OPEN ({len(open_pos)})</b>", "─" * 28]
+        for p in open_pos:
+            last = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
+            entry = float(p["entry_price"])
+            sign = 1 if str(p["action"]).upper() == "BUY" else -1
+            upnl = sign * int(p["remaining_qty"]) * (last - entry)
+            ue = "🟢" if upnl >= 0 else "🔴"
+            lines.append(f"{p['action']} <b>{p['instrument']}</b> ×{p['remaining_qty']}")
+            lines.append(f"   Entry ₹{entry:,.2f} | LTP ₹{last:,.2f} | {ue} ₹{upnl:,.0f}")
+            lv = levels.get(p.get("call_id")) or {}
+            tgt = " / ".join(
+                f"₹{float(t):,.2f}" for t in (lv.get("target_1"), lv.get("target_2")) if t is not None
+            )
+            plan = []
+            if tgt:
+                plan.append(f"🎯 {tgt}")
+            if lv.get("stop_loss") is not None:
+                plan.append(f"🛑 ₹{float(lv['stop_loss']):,.2f}")
+            if plan:
+                lines.append("   " + "  ".join(plan))
+
+    closed = get_closed_paper_positions(15)
+    if closed:
+        head = f"<b>📒 CLOSED TRADES ({s['closed_trades']})</b>"
+        if s["closed_trades"] > len(closed):
+            head += f" <i>— showing last {len(closed)}</i>"
+        lines += ["", head, _paper_trade_table(closed),
+                  "<i>🟢 profit · 🔴 loss · amounts in ₹</i>"]
+
+    lines += ["", DISCLAIMER_HTML]
+    return "\n".join(lines)
+
+
 class TelegramAdvisoryBot:
     """Advisory-only Telegram bot with subscriber management and call push."""
 
@@ -132,6 +464,9 @@ class TelegramAdvisoryBot:
         self.app.add_handler(CommandHandler("calls", self._cmd_calls))
         self.app.add_handler(CommandHandler("track", self._cmd_track))
         self.app.add_handler(CommandHandler("categories", self._cmd_categories))
+        self.app.add_handler(CommandHandler("pnl", self._cmd_pnl))
+        self.app.add_handler(CommandHandler("review", self._cmd_review))
+        self.app.add_handler(CommandHandler("paper", self._cmd_paper))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CallbackQueryHandler(self._on_category_toggle, pattern=r"^cat:"))
 
@@ -206,6 +541,34 @@ class TelegramAdvisoryBot:
             reply_markup=self._category_keyboard(sub.get("categories", "")),
         )
 
+    async def _cmd_pnl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the owner's live INDStocks positions & today's P&L (read-only)."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /pnl is restricted to the account owner.")
+            return
+        await update.message.reply_text("📊 Fetching your positions…")
+        report = await asyncio.to_thread(build_pnl_report)
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    async def _cmd_review(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """AI next-session action plan over the owner's open positions (read-only)."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /review is restricted to the account owner.")
+            return
+        await update.message.reply_text(
+            "🤖 Analysing your open positions… this can take a few seconds."
+        )
+        report = await asyncio.to_thread(build_position_review)
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    async def _cmd_paper(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the simulated (shadow) account's performance (owner only)."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /paper is restricted to the account owner.")
+            return
+        report = await asyncio.to_thread(build_paper_report)
+        await update.message.reply_text(report, parse_mode="HTML")
+
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "*OptionBuddy Advisory — Help*\n\n"
@@ -214,6 +577,9 @@ class TelegramAdvisoryBot:
             "• /calls — currently active calls\n"
             "• /track — accuracy & win rate\n"
             "• /categories — choose Index Options / Equity / Futures / Commodity\n"
+            "• /pnl — your live positions & today's P&L (owner only)\n"
+            "• /review — AI plan for your open positions next session (owner only)\n"
+            "• /paper — shadow account performance, no real money (owner only)\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
             parse_mode="Markdown",
@@ -292,6 +658,17 @@ class TelegramAdvisoryBot:
                 )
             except Exception as e:
                 log.warning("Failed to broadcast to %s: %s", sub["chat_id"], e)
+
+    async def notify_owner(self, text: str, parse_mode: str = "HTML") -> None:
+        """Send a private message to the account owner only (e.g. paper-trade fills)."""
+        if not TELEGRAM_CHAT_ID:
+            return
+        try:
+            await self.app.bot.send_message(
+                chat_id=int(TELEGRAM_CHAT_ID), text=text, parse_mode=parse_mode
+            )
+        except Exception as e:
+            log.warning("Failed to notify owner: %s", e)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

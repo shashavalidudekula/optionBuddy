@@ -75,10 +75,61 @@ CREATE TABLE IF NOT EXISTS subscribers (
 );
 """
 
+CREATE_PAPER_ACCOUNT = """
+CREATE TABLE IF NOT EXISTS paper_account (
+    id               INTEGER PRIMARY KEY,
+    starting_capital NUMERIC(14, 2) NOT NULL,
+    cash             NUMERIC(14, 2) NOT NULL,
+    realized_pnl     NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    peak_equity      NUMERIC(14, 2) NOT NULL,
+    max_drawdown_pct NUMERIC(8, 2) NOT NULL DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT NOW(),
+    updated_at       TIMESTAMP DEFAULT NOW()
+);
+"""
+
+CREATE_PAPER_POSITIONS = """
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id            SERIAL PRIMARY KEY,
+    call_id       INTEGER,
+    instrument    TEXT NOT NULL,
+    underlying    TEXT,
+    category      TEXT,
+    action        TEXT NOT NULL,
+    lot_size      INTEGER NOT NULL,
+    lots          INTEGER NOT NULL,
+    quantity      INTEGER NOT NULL,
+    remaining_qty INTEGER NOT NULL,
+    entry_price   NUMERIC(12, 2) NOT NULL,
+    last_price    NUMERIC(12, 2),
+    realized_pnl  NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'open',
+    opened_at     TIMESTAMP DEFAULT NOW(),
+    closed_at     TIMESTAMP
+);
+"""
+
+CREATE_PAPER_FILLS = """
+CREATE TABLE IF NOT EXISTS paper_fills (
+    id           SERIAL PRIMARY KEY,
+    position_id  INTEGER,
+    call_id      INTEGER,
+    instrument   TEXT,
+    kind         TEXT,
+    qty          INTEGER,
+    price        NUMERIC(12, 2),
+    realized_pnl NUMERIC(14, 2) DEFAULT 0,
+    ts           TIMESTAMP DEFAULT NOW()
+);
+"""
+
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(status)",
     "CREATE INDEX IF NOT EXISTS idx_calls_category ON calls(category)",
     "CREATE INDEX IF NOT EXISTS idx_calls_issued ON calls(issued_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_paper_pos_status ON paper_positions(status)",
+    "CREATE INDEX IF NOT EXISTS idx_paper_pos_call ON paper_positions(call_id)",
+    "CREATE INDEX IF NOT EXISTS idx_paper_fills_ts ON paper_fills(ts)",
 ]
 
 
@@ -96,10 +147,13 @@ def init_advisory_db() -> None:
     try:
         cur.execute(CREATE_CALLS)
         cur.execute(CREATE_SUBSCRIBERS)
+        cur.execute(CREATE_PAPER_ACCOUNT)
+        cur.execute(CREATE_PAPER_POSITIONS)
+        cur.execute(CREATE_PAPER_FILLS)
         for idx in INDEXES:
             cur.execute(idx)
         conn.commit()
-        log.info("Advisory tables initialised (calls, subscribers)")
+        log.info("Advisory tables initialised (calls, subscribers, paper_*)")
     finally:
         cur.close()
         conn.close()
@@ -337,6 +391,298 @@ def get_all_active_subscribers() -> list[dict]:
     finally:
         cur.close()
         conn.close()
+
+
+# ── Paper trading (shadow mode) ───────────────────────────────────────────────
+
+def ensure_paper_account(starting_capital: float) -> dict:
+    """Create the single paper account (id=1) if absent; return it."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM paper_account WHERE id = 1")
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                """INSERT INTO paper_account
+                   (id, starting_capital, cash, realized_pnl, peak_equity)
+                   VALUES (1, %s, %s, 0, %s)""",
+                (starting_capital, starting_capital, starting_capital),
+            )
+            conn.commit()
+            cur.execute("SELECT * FROM paper_account WHERE id = 1")
+            row = cur.fetchone()
+            log.info("Paper account created with ₹%.2f starting capital", starting_capital)
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_paper_account() -> dict | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM paper_account WHERE id = 1")
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_open_paper_positions() -> list[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM paper_positions WHERE status = 'open' ORDER BY opened_at")
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_closed_paper_positions(limit: int = 15) -> list[dict]:
+    """Most-recently-closed paper positions, newest first (for the /paper ledger)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM paper_positions WHERE status = 'closed' "
+            "ORDER BY closed_at DESC NULLS LAST LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_call_levels(call_ids: list) -> dict:
+    """Map call_id → {target_1, target_2, stop_loss, entry_price} for display."""
+    ids = [int(c) for c in call_ids if c is not None]
+    if not ids:
+        return {}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, target_1, target_2, stop_loss, entry_price FROM calls WHERE id = ANY(%s)",
+            (ids,),
+        )
+        return {
+            r[0]: {"target_1": r[1], "target_2": r[2], "stop_loss": r[3], "entry_price": r[4]}
+            for r in cur.fetchall()
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_open_paper_position_by_call(call_id: int) -> dict | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM paper_positions WHERE call_id = %s AND status = 'open' LIMIT 1",
+            (call_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
+def open_paper_position(
+    *, call_id, instrument, underlying, category, action,
+    lot_size, lots, entry_price, cash_delta,
+) -> int:
+    """Open a simulated position and apply the entry cashflow atomically."""
+    qty = lots * lot_size
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO paper_positions
+               (call_id, instrument, underlying, category, action, lot_size, lots,
+                quantity, remaining_qty, entry_price, last_price, status)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open') RETURNING id""",
+            (call_id, instrument, underlying, category, action, lot_size, lots,
+             qty, qty, entry_price, entry_price),
+        )
+        pos_id = cur.fetchone()[0]
+        cur.execute(
+            "UPDATE paper_account SET cash = cash + %s, updated_at = NOW() WHERE id = 1",
+            (cash_delta,),
+        )
+        cur.execute(
+            """INSERT INTO paper_fills (position_id, call_id, instrument, kind, qty, price, realized_pnl)
+               VALUES (%s,%s,%s,'entry',%s,%s,0)""",
+            (pos_id, call_id, instrument, qty, entry_price),
+        )
+        conn.commit()
+        return pos_id
+    finally:
+        cur.close()
+        conn.close()
+
+
+def book_paper_exit(
+    *, position_id, call_id, instrument, exit_qty, exit_price,
+    realized_delta, cash_delta, kind, fully_closed,
+) -> None:
+    """Reduce/close a position, apply exit cashflow and realized P&L atomically."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        if fully_closed:
+            cur.execute(
+                """UPDATE paper_positions
+                   SET remaining_qty = remaining_qty - %s, realized_pnl = realized_pnl + %s,
+                       last_price = %s, status = 'closed', closed_at = NOW()
+                   WHERE id = %s""",
+                (exit_qty, realized_delta, exit_price, position_id),
+            )
+        else:
+            cur.execute(
+                """UPDATE paper_positions
+                   SET remaining_qty = remaining_qty - %s, realized_pnl = realized_pnl + %s,
+                       last_price = %s
+                   WHERE id = %s""",
+                (exit_qty, realized_delta, exit_price, position_id),
+            )
+        cur.execute(
+            "UPDATE paper_account SET cash = cash + %s, realized_pnl = realized_pnl + %s, "
+            "updated_at = NOW() WHERE id = 1",
+            (cash_delta, realized_delta),
+        )
+        cur.execute(
+            """INSERT INTO paper_fills (position_id, call_id, instrument, kind, qty, price, realized_pnl)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (position_id, call_id, instrument, kind, exit_qty, exit_price, realized_delta),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def set_paper_position_last_price(position_id: int, last_price: float) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE paper_positions SET last_price = %s WHERE id = %s",
+            (last_price, position_id),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def compute_paper_equity() -> float:
+    """Mark-to-market equity = cash + Σ(signed remaining qty × last price)."""
+    acct = get_paper_account()
+    if not acct:
+        return 0.0
+    equity = float(acct["cash"])
+    for p in get_open_paper_positions():
+        price = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
+        sign = 1 if str(p["action"]).upper() == "BUY" else -1
+        equity += sign * int(p["remaining_qty"]) * price
+    return round(equity, 2)
+
+
+def record_paper_equity(equity: float) -> None:
+    """Track peak equity and max drawdown from the current mark-to-market equity."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT peak_equity, max_drawdown_pct FROM paper_account WHERE id = 1")
+        r = cur.fetchone()
+        if not r:
+            return
+        peak = max(float(r[0]), equity)
+        dd = (peak - equity) / peak * 100 if peak > 0 else 0.0
+        mdd = max(float(r[1]), dd)
+        cur.execute(
+            "UPDATE paper_account SET peak_equity = %s, max_drawdown_pct = %s, updated_at = NOW() WHERE id = 1",
+            (round(peak, 2), round(mdd, 2)),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_paper_today_realized() -> float:
+    """Sum of realized P&L booked today (for the daily-loss-limit guardrail)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) FROM paper_fills WHERE ts::date = CURRENT_DATE"
+        )
+        return float(cur.fetchone()[0] or 0.0)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_paper_stats() -> dict:
+    """Summary of the paper account: equity, returns, P&L, win rate, drawdown."""
+    acct = get_paper_account()
+    if not acct:
+        return {}
+    equity = compute_paper_equity()
+    start = float(acct["starting_capital"])
+
+    open_positions = get_open_paper_positions()
+    unrealized = 0.0
+    for p in open_positions:
+        price = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
+        sign = 1 if str(p["action"]).upper() == "BUY" else -1
+        unrealized += sign * int(p["remaining_qty"]) * (price - float(p["entry_price"]))
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT realized_pnl FROM paper_positions WHERE status = 'closed'")
+        closed = [float(r[0]) for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+    wins = sum(1 for p in closed if p > 0)
+    total = len(closed)
+    return {
+        "starting_capital": start,
+        "cash": float(acct["cash"]),
+        "equity": equity,
+        "total_return_pct": round((equity - start) / start * 100, 2) if start else 0.0,
+        "realized_pnl": float(acct["realized_pnl"]),
+        "unrealized_pnl": round(unrealized, 2),
+        "today_realized": get_paper_today_realized(),
+        "open_positions": len(open_positions),
+        "closed_trades": total,
+        "wins": wins,
+        "losses": total - wins,
+        "win_rate": round(100.0 * wins / total, 1) if total else 0.0,
+        "max_drawdown_pct": float(acct["max_drawdown_pct"]),
+    }
 
 
 # ── Performance / Track Record ───────────────────────────────────────────────
