@@ -45,6 +45,7 @@ from core.paper_trader import PaperTrader
 from core.indstocks_auth import get_session
 from core.indstocks_data import (
     get_market_snapshot, make_price_lookup, get_option_chain, get_index_spots,
+    option_expiry_for,
 )
 from data.news_fetcher import get_top_headlines
 from notifier.telegram_advisory_bot import (
@@ -97,6 +98,7 @@ def _generate_all_categories(session, categories) -> list[tuple[dict, int]]:
                     "option_chain": {
                         "NIFTY": get_option_chain(session, "NIFTY"),
                         "BANKNIFTY": get_option_chain(session, "BANKNIFTY"),
+                        "SENSEX": get_option_chain(session, "SENSEX"),
                     },
                 }
             except Exception as e:
@@ -107,6 +109,14 @@ def _generate_all_categories(session, categories) -> list[tuple[dict, int]]:
             log.error("Generation failed for %s: %s", cat, e)
             continue
         for call in calls:
+            # Stamp the option's real contract expiry (for display + EOD settlement).
+            if cat == "index_option" and session is not None:
+                try:
+                    exp = option_expiry_for(session, call.get("underlying", ""), call.get("instrument", ""))
+                    if exp:
+                        call["option_expiry"] = exp.isoformat()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("Expiry resolve failed (%s): %s", call.get("instrument"), e)
             try:
                 call_id = save_call(call)
             except Exception as e:
@@ -159,7 +169,7 @@ class OptionGenTrigger:
         reasons: list[str] = []
         if now - self.last_gen >= OPT_GEN_FLOOR_SEC:
             reasons.append("floor")
-        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY")):
+        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             cur, ref = spots.get(lbl), self.ref_spot.get(lbl)
             if cur and ref and abs(cur - ref) / ref * 100 >= GEN_MOVE_PCT:
                 reasons.append(f"{idx} {(cur - ref) / ref * 100:+.2f}%")
@@ -173,7 +183,7 @@ class OptionGenTrigger:
 
     def commit(self, spots: dict) -> None:
         self.last_gen = time.time()
-        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY")):
+        for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             if spots.get(lbl):
                 self.ref_spot[lbl] = spots[lbl]
                 self.ref_atm[lbl] = self._atm(idx, spots[lbl])
@@ -300,14 +310,17 @@ async def run() -> None:
                     log.error("Tracking pass failed: %s", e)
 
                 # 2) Event-driven index-option generation — fire when the market moves.
+                #    Skip when spots are unavailable (e.g. feed hiccup) so we don't
+                #    fire blindly or hammer the quote API without ATM grounding.
                 if session is not None:
                     try:
                         spots = await asyncio.to_thread(get_index_spots, session)
-                        fire, reason = opt_trigger.check(spots)
-                        if fire:
-                            log.info("Option scan triggered (%s)", reason or "—")
-                            await run_generation_cycle(bot, session, ["index_option"])
-                            opt_trigger.commit(spots)
+                        if spots:
+                            fire, reason = opt_trigger.check(spots)
+                            if fire:
+                                log.info("Option scan triggered (%s)", reason or "—")
+                                await run_generation_cycle(bot, session, ["index_option"])
+                                opt_trigger.commit(spots)
                     except Exception as e:
                         log.error("Option generation failed: %s", e)
 
@@ -323,6 +336,16 @@ async def run() -> None:
 
             # EOD digest — once per trading day, after close.
             if (_is_weekday(now) and now.time() >= EOD_AFTER and eod_date != today):
+                # Settle paper positions whose options expire today (cash-settled at close).
+                if paper is not None:
+                    try:
+                        notes = await asyncio.to_thread(paper.settle_expiry, price_lookup, today)
+                        for note in notes:
+                            await bot.notify_owner(note)
+                        if notes:
+                            log.info("Expiry settlement closed %s position(s)", len(notes))
+                    except Exception as e:
+                        log.error("Expiry settlement failed: %s", e)
                 try:
                     await send_eod_summary(bot)
                 except Exception as e:

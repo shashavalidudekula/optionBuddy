@@ -29,7 +29,7 @@ DB_NAME = os.getenv("DB_NAME", "trading_agent")
 DB_USER = os.getenv("DB_USER", "trading_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "trading_password")
 
-CATEGORIES = ("index_option", "equity", "futures", "commodity")
+CATEGORIES = ("index_option", "equity", "futures")
 DEFAULT_CATEGORIES = ",".join(CATEGORIES)
 
 # Terminal statuses (call no longer tracked / scored)
@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS calls (
     raw_json        TEXT,
     issued_at       TIMESTAMP DEFAULT NOW(),
     expires_at      TIMESTAMP,
-    closed_at       TIMESTAMP
+    closed_at       TIMESTAMP,
+    option_expiry   DATE
 );
 """
 
@@ -150,6 +151,8 @@ def init_advisory_db() -> None:
         cur.execute(CREATE_PAPER_ACCOUNT)
         cur.execute(CREATE_PAPER_POSITIONS)
         cur.execute(CREATE_PAPER_FILLS)
+        # Migration for pre-existing DBs that lack the option_expiry column.
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS option_expiry DATE")
         for idx in INDEXES:
             cur.execute(idx)
         conn.commit()
@@ -184,8 +187,8 @@ def save_call(call: dict) -> int:
             """INSERT INTO calls
                (category, instrument, underlying, action, timeframe,
                 entry_price, entry_min, entry_max, target_1, target_2, stop_loss,
-                confidence, rationale, status, raw_json, expires_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                confidence, rationale, status, raw_json, expires_at, option_expiry)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                RETURNING id""",
             (
                 call.get("category", ""),
@@ -204,6 +207,7 @@ def save_call(call: dict) -> int:
                 "active",
                 json.dumps(call, default=str),
                 expires_at,
+                call.get("option_expiry"),
             ),
         )
         call_id = cur.fetchone()[0]
@@ -224,6 +228,23 @@ def get_active_calls() -> list[dict]:
         cur.execute(
             "SELECT * FROM calls WHERE status NOT IN %s ORDER BY issued_at DESC",
             (CLOSED_STATUSES,),
+        )
+        rows = cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        return [dict(zip(columns, r)) for r in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_closed_calls(limit: int = 50) -> list[dict]:
+    """Calls that have reached a terminal status, newest first (for the dashboard)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM calls WHERE status IN %s ORDER BY issued_at DESC LIMIT %s",
+            (CLOSED_STATUSES, limit),
         )
         rows = cur.fetchall()
         columns = [d[0] for d in cur.description]
@@ -475,13 +496,39 @@ def get_call_levels(call_ids: list) -> dict:
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT id, target_1, target_2, stop_loss, entry_price FROM calls WHERE id = ANY(%s)",
+            "SELECT id, target_1, target_2, stop_loss, entry_price, option_expiry "
+            "FROM calls WHERE id = ANY(%s)",
             (ids,),
         )
         return {
-            r[0]: {"target_1": r[1], "target_2": r[2], "stop_loss": r[3], "entry_price": r[4]}
+            r[0]: {"target_1": r[1], "target_2": r[2], "stop_loss": r[3],
+                   "entry_price": r[4], "option_expiry": r[5]}
             for r in cur.fetchall()
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_paper_fills_on(date_str: str) -> list[dict]:
+    """Every realized booking (partial/exit/stop/expiry) on a date, with the
+    position's entry price + side. Summing realized_pnl here equals the account's
+    realized for that day — it includes partials booked on still-open positions."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT f.ts, f.instrument, f.kind, f.qty, f.price, f.realized_pnl,
+                      p.entry_price, p.action
+               FROM paper_fills f
+               LEFT JOIN paper_positions p ON p.id = f.position_id
+               WHERE f.ts::date = %s AND f.kind <> 'entry'
+               ORDER BY f.ts""",
+            (date_str,),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
     finally:
         cur.close()
         conn.close()

@@ -9,6 +9,9 @@ services:
       POSTGRES_DB: trading_agent
       POSTGRES_USER: trading_user
       POSTGRES_PASSWORD: trading_password
+      TZ: Asia/Kolkata
+      PGTZ: Asia/Kolkata
+    command: ["postgres", "-c", "timezone=Asia/Kolkata"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -39,6 +42,34 @@ services:
       TZ: Asia/Kolkata
     volumes:
       - ./logs:/app/logs
+    networks:
+      - trading-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: .
+    container_name: optionbuddy-dashboard
+    restart: unless-stopped
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    ports:
+      - "8000:8000"
     networks:
       - trading-network
     logging:

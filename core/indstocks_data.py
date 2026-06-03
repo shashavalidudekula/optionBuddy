@@ -41,6 +41,8 @@ _INDEX_ALIASES = {
     "NIFTY": ("NIFTY", "NIFTY 50", "NIFTY50"),
     "BANKNIFTY": ("BANKNIFTY", "BANK NIFTY", "NIFTY BANK"),
     "FINNIFTY": ("FINNIFTY", "NIFTY FIN SERVICE", "FIN NIFTY"),
+    "SENSEX": ("SENSEX", "BSE SENSEX", "S&P BSE SENSEX"),
+    "BANKEX": ("BANKEX", "BSE BANKEX", "S&P BSE BANKEX"),
     "INDIAVIX": ("INDIA VIX", "INDIAVIX"),
 }
 
@@ -290,7 +292,7 @@ def get_market_snapshot(session) -> dict:
     snap: dict = {}
 
     index_codes = {}
-    for key in ("NIFTY", "BANKNIFTY", "INDIAVIX"):
+    for key in ("NIFTY", "BANKNIFTY", "SENSEX", "INDIAVIX"):
         code = _index_scrip(key)
         if code:
             index_codes[key.lower()] = code
@@ -309,10 +311,10 @@ def get_market_snapshot(session) -> dict:
     # single live price point: daily structure + live intraday (5-min) context.
     try:
         from core.technicals import get_technicals, get_intraday_technicals
-        tech = get_technicals(["NIFTY", "BANKNIFTY"])
+        tech = get_technicals(["NIFTY", "BANKNIFTY", "SENSEX"])
         if tech:
             snap["technicals"] = tech
-        intraday = get_intraday_technicals(["NIFTY", "BANKNIFTY"])
+        intraday = get_intraday_technicals(["NIFTY", "BANKNIFTY", "SENSEX"])
         if intraday:
             snap["intraday"] = intraday
     except Exception as e:
@@ -323,10 +325,10 @@ def get_market_snapshot(session) -> dict:
 
 
 def get_index_spots(session) -> dict[str, float]:
-    """Cheap live spot for NIFTY / BANKNIFTY / INDIA VIX (for generation triggers)."""
+    """Cheap live spot for NIFTY / BANKNIFTY / SENSEX / INDIA VIX (for triggers)."""
     _load_master(session)
     codes = {}
-    for key in ("NIFTY", "BANKNIFTY", "INDIAVIX"):
+    for key in ("NIFTY", "BANKNIFTY", "SENSEX", "INDIAVIX"):
         c = _index_scrip(key)
         if c:
             codes[key.lower()] = c
@@ -364,8 +366,12 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
             return 0.0
 
     strikes = sorted({_strike(r) for r in rows if _strike(r) > 0})
-    if spot and strikes:
-        atm = min(strikes, key=lambda s: abs(s - spot))
+    # Always trim to ATM±count so we never request hundreds of LTP codes (which
+    # 400s on URL length / 429s on rate limit). If spot is unavailable (e.g. after
+    # hours), fall back to the median strike as a pseudo-ATM to keep it bounded.
+    ref = spot if spot else (strikes[len(strikes) // 2] if strikes else None)
+    if ref and strikes:
+        atm = min(strikes, key=lambda s: abs(s - ref))
         idx = strikes.index(atm)
         lo, hi = max(0, idx - count), idx + count + 1
         wanted = set(strikes[lo:hi])
@@ -386,6 +392,31 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
         })
     chain.sort(key=lambda c: (c["strike"], c["option_type"]))
     return chain
+
+
+def option_expiry_for(session, underlying: str, instrument: str) -> date | None:
+    """Nearest-expiry DATE for the option in `instrument` (e.g. 'NIFTY 23400 PE')."""
+    m = _OPTION_RE.search(instrument or "")
+    if not m:
+        return None
+    strike = float(m.group(1))
+    ot = m.group(2).upper()
+    u = (underlying or "").upper().strip()
+    _load_master(session)
+    rows = [r for r in _master.get("fno", [])
+            if _fno_underlying(r) == u and (r.get("OPTION_TYPE") or "").upper() == ot]
+    if not rows:
+        return None
+
+    def _strike_match(r):
+        try:
+            return abs(float(r.get("STRIKE_PRICE", "0")) - strike) < 0.5
+        except (TypeError, ValueError):
+            return False
+
+    cand = [r for r in rows if _strike_match(r)] or rows
+    exp = _nearest_expiry(cand, date.today())
+    return _parse_expiry(exp) if exp else None
 
 
 def get_lot_size(session, underlying: str) -> int | None:

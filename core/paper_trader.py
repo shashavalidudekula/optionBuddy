@@ -21,10 +21,14 @@ Cash model (keeps equity internally consistent):
     SELL entry: cash += qty×entry      exit: cash -= qty×exit   pnl = qty×(entry-exit)
 """
 
+import json
 import math
+import os
+from datetime import datetime
 
 from config.logger import get_logger
 from config.settings import (
+    LOG_DIR,
     MIN_CONFIDENCE,
     PAPER_CATEGORIES,
     PAPER_DAILY_LOSS_PCT,
@@ -33,7 +37,7 @@ from config.settings import (
     PAPER_RISK_PCT,
     PAPER_START_CAPITAL,
 )
-from core.indstocks_data import get_lot_size
+from core.indstocks_data import get_lot_size, option_expiry_for
 from data.advisory_store import (
     book_paper_exit,
     compute_paper_equity,
@@ -62,6 +66,54 @@ def _pnl_cash(action: str, entry: float, exit_price: float, qty: int) -> tuple[f
     if action == "BUY":
         return round((exit_price - entry) * qty, 2), round(qty * exit_price, 2)
     return round((entry - exit_price) * qty, 2), round(-qty * exit_price, 2)
+
+
+# ── persistent daily history ───────────────────────────────────────────────────
+# Closed trades are appended to a JSON-lines file on the host-mounted logs volume.
+# It survives a Postgres reset (so the live account can start fresh each day while
+# /paper <date> still shows past days' results).
+_HISTORY_PATH = os.path.join(LOG_DIR, "paper_history.jsonl")
+
+
+def _append_history(rec: dict) -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_HISTORY_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Paper history append failed: %s", e)
+
+
+def read_paper_day(date_str: str) -> dict:
+    """Aggregate the persisted closed trades for one date (YYYY-MM-DD)."""
+    trades: list[dict] = []
+    try:
+        with open(_HISTORY_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("date") == date_str:
+                    trades.append(rec)
+    except FileNotFoundError:
+        pass
+    pnl = round(sum(float(t.get("pnl", 0) or 0) for t in trades), 2)
+    wins = sum(1 for t in trades if float(t.get("pnl", 0) or 0) > 0)
+    losses = sum(1 for t in trades if float(t.get("pnl", 0) or 0) < 0)
+    return {
+        "date": date_str,
+        "trades": trades,
+        "pnl": pnl,
+        "count": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(100.0 * wins / (wins + losses), 1) if (wins + losses) else 0.0,
+        "return_pct": round(pnl / PAPER_START_CAPITAL * 100, 2) if PAPER_START_CAPITAL else 0.0,
+    }
 
 
 class PaperTrader:
@@ -204,6 +256,7 @@ class PaperTrader:
             realized_delta=realized, cash_delta=cash_delta, kind="partial", fully_closed=False,
         )
         log.info("PAPER PARTIAL %s ×%s @ %.2f (pnl %.0f)", pos["instrument"], exit_qty, exit_price, realized)
+        self._log_trade(pos, exit_qty, exit_price, realized, "partial")
         emoji = "🟢" if realized >= 0 else "🔴"
         return (f"💰 <b>PAPER T1</b> booked {exit_qty} of <b>{pos['instrument']}</b> "
                 f"@ ₹{exit_price:,.2f} {emoji} ₹{realized:,.0f}")
@@ -228,10 +281,70 @@ class PaperTrader:
         )
         log.info("PAPER CLOSE (%s) %s ×%s @ %.2f (pnl %.0f)", kind, pos["instrument"],
                  remaining, exit_price, realized)
+        self._log_trade(pos, remaining, exit_price, realized, kind)
         label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY"}.get(kind, "PAPER CLOSE")
         emoji = "✅" if realized >= 0 else "❌"
         return (f"{label} <b>{pos['instrument']}</b> ×{remaining} @ ₹{exit_price:,.2f} "
                 f"{emoji} ₹{realized:,.0f}")
+
+    @staticmethod
+    def _log_trade(pos: dict, qty, exit_price, realized, kind: str) -> None:
+        """Append a closed-trade record to the durable daily history."""
+        now = datetime.now()
+        _append_history({
+            "date": now.strftime("%Y-%m-%d"),
+            "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "instrument": pos.get("instrument"),
+            "underlying": pos.get("underlying"),
+            "category": pos.get("category"),
+            "action": str(pos.get("action")).upper(),
+            "qty": int(qty),
+            "entry": float(pos.get("entry_price")),
+            "exit": round(float(exit_price), 2),
+            "pnl": realized,
+            "kind": kind,
+        })
+
+    # ── expiry settlement ───────────────────────────────────────────────────────
+
+    def settle_expiry(self, price_lookup, today) -> list[str]:
+        """Close any open position whose option expires on/before `today`.
+
+        Options are cash-settled at expiry, so at the close of the expiry day we
+        settle the remaining lots at the last traded premium (best available proxy
+        when the live feed is already down after hours).
+        """
+        from data.advisory_store import get_call_levels
+
+        notes: list[str] = []
+        open_pos = get_open_paper_positions()
+        if not open_pos:
+            return notes
+        levels = get_call_levels([p.get("call_id") for p in open_pos])
+        for pos in open_pos:
+            cid = pos.get("call_id")
+            exp = (levels.get(cid) or {}).get("option_expiry")
+            if exp is None:  # older calls: resolve the contract expiry from the master
+                try:
+                    exp = option_expiry_for(self.session, pos.get("underlying", ""), pos.get("instrument", ""))
+                except Exception:  # noqa: BLE001
+                    exp = None
+            if exp is None or exp > today:
+                continue
+            mini = {"category": pos.get("category"), "underlying": pos.get("underlying"),
+                    "instrument": pos.get("instrument")}
+            price = None
+            try:
+                price = price_lookup(mini)
+            except Exception:  # noqa: BLE001
+                price = None
+            if price is None:
+                price = float(pos["last_price"]) if pos["last_price"] is not None else float(pos["entry_price"])
+            note = self._close({"id": cid}, float(price), "expiry")
+            if note:
+                log.info("PAPER EXPIRY SETTLE %s (expiry %s) @ %.2f", pos.get("instrument"), exp, float(price))
+                notes.append(note)
+        return notes
 
     # ── mark-to-market ─────────────────────────────────────────────────────────
 

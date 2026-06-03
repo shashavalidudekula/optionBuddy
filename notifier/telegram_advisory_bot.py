@@ -32,7 +32,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_START_CAPITAL
 from config.logger import get_logger
 from data.advisory_store import (
     CATEGORIES,
@@ -451,6 +451,81 @@ def build_paper_report() -> str:
     return "\n".join(lines)
 
 
+def _parse_date_arg(s: str) -> str | None:
+    """Parse a user date (YYYY/MM/DD, YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY) → YYYY-MM-DD."""
+    import datetime as _dt
+    s = (s or "").strip()
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return _dt.datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _paper_day_table(trades: list[dict]) -> str:
+    header = f"{'Time':<5} {'Instrument':<15} {'Side':<4} {'Entry':>8} {'Exit':>8} {'P&L':>9}"
+    out = [header]
+    for t in trades:
+        tm = str(t.get("ts", ""))[11:16] or "  -  "
+        instr = str(t.get("instrument", ""))[:15]
+        side = str(t.get("action", "")).upper()[:4]
+        entry = float(t.get("entry") or 0)
+        exit_p = float(t.get("exit") or 0)
+        pnl = float(t.get("pnl") or 0)
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        out.append(f"{tm:<5} {instr:<15} {side:<4} {entry:>8.2f} {exit_p:>8.2f} {pnl:>+9,.0f}  {emoji}")
+    return "<pre>" + html.escape("\n".join(out)) + "</pre>"
+
+
+def build_paper_day_report(date_str: str) -> str:
+    """Render the paper results for one date.
+
+    Reads the database first (authoritative for the current session, before any
+    overnight reset), and falls back to the durable file log for older dates the
+    DB no longer holds.
+    """
+    from data.advisory_store import get_paper_fills_on
+    from core.paper_trader import read_paper_day
+
+    trades: list[dict] = []
+    for fr in get_paper_fills_on(date_str):  # one row per realized booking (partial + close)
+        ts = fr.get("ts")
+        trades.append({
+            "ts": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts or ""),
+            "instrument": fr.get("instrument"),
+            "action": fr.get("action") or "",
+            "entry": float(fr["entry_price"]) if fr.get("entry_price") is not None else 0.0,
+            "exit": float(fr["price"]) if fr.get("price") is not None else 0.0,
+            "pnl": float(fr.get("realized_pnl") or 0),
+        })
+    if not trades:  # fall back to the durable archive (past days after a reset)
+        trades = read_paper_day(date_str)["trades"]
+
+    if not trades:
+        return (f"ℹ️ <b>No paper trades recorded on {date_str}.</b>\n"
+                "<i>Daily history is captured from when this build went live; earlier days "
+                "may be unavailable.</i>")
+
+    pnl = round(sum(float(t.get("pnl", 0) or 0) for t in trades), 2)
+    wins = sum(1 for t in trades if float(t.get("pnl", 0) or 0) > 0)
+    losses = sum(1 for t in trades if float(t.get("pnl", 0) or 0) < 0)
+    ret = round(pnl / PAPER_START_CAPITAL * 100, 2) if PAPER_START_CAPITAL else 0.0
+    emoji = "🟢" if pnl >= 0 else "🔴"
+    lines = [
+        f"🧪 <b>PAPER — {date_str}</b> <i>(shadow — no real money)</i>",
+        "─" * 28,
+        f"Realised P&L: {emoji} ₹{pnl:,.0f}  ({ret:+.2f}% on ₹{PAPER_START_CAPITAL:,.0f})",
+        f"Trades: <b>{len(trades)}</b>  (W {wins} / L {losses})",
+        "",
+        _paper_day_table(trades),
+        "<i>🟢 profit · 🔴 loss · amounts in ₹</i>",
+        "",
+        DISCLAIMER_HTML,
+    ]
+    return "\n".join(lines)
+
+
 # ── /calls — rich, grouped view of every active call (all categories) ──────────
 
 _CALL_STATUS_LABEL = {
@@ -471,6 +546,21 @@ _CAT_ARG = {
 _CATEGORY_ORDER = ["index_option", "equity", "futures", "commodity"]
 
 
+def _fmt_expiry(v) -> str | None:
+    """Format an option_expiry (date or 'YYYY-MM-DD' str) as 'DD Mon'."""
+    if not v:
+        return None
+    try:
+        return v.strftime("%d %b")
+    except AttributeError:
+        s = str(v)[:10]
+        try:
+            import datetime as _dt
+            return _dt.datetime.strptime(s, "%Y-%m-%d").strftime("%d %b")
+        except ValueError:
+            return s
+
+
 def _call_block_html(c: dict, live) -> str:
     action = str(c.get("action", "")).upper()
     arrow = "🟢" if action == "BUY" else "🔴"
@@ -482,9 +572,13 @@ def _call_block_html(c: dict, live) -> str:
     else:
         entry = f"₹{float(c.get('entry_price') or 0):,.2f}"
 
+    head = (f"{arrow} <b>{action} {html.escape(str(c.get('instrument', '?')))}</b>  ·  "
+            f"conf {c.get('confidence', 0)}%  ·  #{c.get('id')}")
+    exp = _fmt_expiry(c.get("option_expiry"))
+    if exp:
+        head += f"  ·  ⏳ exp {exp}"
     parts = [
-        f"{arrow} <b>{action} {html.escape(str(c.get('instrument', '?')))}</b>  ·  "
-        f"conf {c.get('confidence', 0)}%  ·  #{c.get('id')}",
+        head,
         f"   {status}" + (f"  ·  LTP ₹{float(live):,.2f}" if live is not None else ""),
         f"   Entry: {entry}",
     ]
@@ -493,8 +587,6 @@ def _call_block_html(c: dict, live) -> str:
         parts.append(f"   🎯 {tg}")
     if c.get("stop_loss") is not None:
         parts.append(f"   🛑 ₹{float(c['stop_loss']):,.2f}")
-    if c.get("rationale"):
-        parts.append(f"   <i>{html.escape(str(c['rationale']))}</i>")
     return "\n".join(parts)
 
 
@@ -656,11 +748,22 @@ class TelegramAdvisoryBot:
         await update.message.reply_text(report, parse_mode="HTML")
 
     async def _cmd_paper(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show the simulated (shadow) account's performance (owner only)."""
+        """Shadow account: /paper = live; /paper YYYY/MM/DD = that date's results (owner only)."""
         if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
             await update.message.reply_text("🔒 /paper is restricted to the account owner.")
             return
-        report = await asyncio.to_thread(build_paper_report)
+        arg = (ctx.args[0] if getattr(ctx, "args", None) else "").strip()
+        if arg:
+            ds = _parse_date_arg(arg)
+            if not ds:
+                await update.message.reply_text(
+                    "Use <code>/paper YYYY/MM/DD</code> — e.g. <code>/paper 2026/06/02</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            report = await asyncio.to_thread(build_paper_day_report, ds)
+        else:
+            report = await asyncio.to_thread(build_paper_report)
         await update.message.reply_text(report, parse_mode="HTML")
 
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -675,6 +778,7 @@ class TelegramAdvisoryBot:
             "• /pnl — your live positions & today's P&L (owner only)\n"
             "• /review — AI plan for your open positions next session (owner only)\n"
             "• /paper — shadow account performance, no real money (owner only)\n"
+            "    ↳ /paper YYYY/MM/DD — that date's results\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
             parse_mode="Markdown",

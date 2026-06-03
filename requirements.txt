@@ -6,3 +6,5 @@ yfinance>=0.2.40
 feedparser>=6.0.11
 python-dotenv>=1.0.1
 psycopg2-binary>=2.9.0
+fastapi>=0.110.0
+uvicorn>=0.29.0

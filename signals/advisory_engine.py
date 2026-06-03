@@ -44,8 +44,9 @@ _INDEX_UNDERLYINGS = {
 
 _CATEGORY_GUIDANCE = {
     "index_option": (
-        "Focus on NIFTY and BANKNIFTY weekly options. Recommend a specific option "
-        "(e.g. 'NIFTY 24500 CE'). All prices (entry/target/stop) are OPTION PREMIUMS in INR, "
+        "Focus on NIFTY, BANKNIFTY and SENSEX index options. Recommend a specific option "
+        "(e.g. 'NIFTY 24500 CE', 'SENSEX 81000 PE'). All prices (entry/target/stop) are OPTION "
+        "PREMIUMS in INR, "
         "not index points. Account for theta decay and IV. Prefer slightly OTM/ATM strikes "
         "with liquidity. Timeframe is usually 'intraday'.\n"
         "IMPORTANT: When an 'option_chain' is provided in the market snapshot, you MUST pick a "

@@ -1,5 +1,8 @@
+.env
 .env.example
 node_modules/
 dist/
 *.log
-.env
+logs/
+__pycache__/
+*.pyc
