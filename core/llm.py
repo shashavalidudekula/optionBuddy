@@ -94,7 +94,7 @@ def _chat_completion(client, model: str, system, prompt, json_mode, max_tokens, 
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=messages, temperature=temperature, max_completion_tokens=max_tokens)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     try:

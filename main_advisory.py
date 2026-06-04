@@ -144,6 +144,8 @@ class OptionGenTrigger:
     India VIX jumps >= GEN_VIX_JUMP_PCT since the last scan; plus a floor so we
     scan at least every OPT_GEN_FLOOR_SEC, and a cooldown so we never scan more
     often than OPT_GEN_MIN_GAP_SEC.
+
+    Forces an immediate scan at market open (9:15 AM) to catch early breakouts.
     """
 
     def __init__(self):
@@ -151,6 +153,7 @@ class OptionGenTrigger:
         self.ref_spot: dict[str, float] = {}
         self.ref_atm: dict[str, float] = {}
         self.ref_vix: float | None = None
+        self.market_open_scanned = False
 
     @staticmethod
     def _atm(index: str, spot: float | None) -> float | None:
@@ -160,14 +163,21 @@ class OptionGenTrigger:
         return round(spot / step) * step
 
     def check(self, spots: dict) -> tuple[bool, str]:
-        now = time.time()
-        if now - self.last_gen < OPT_GEN_MIN_GAP_SEC:
+        now = datetime.now()
+        now_ts = time.time()
+
+        # Force scan at market open (9:15 AM) to catch early breakouts
+        if (not self.market_open_scanned and now.time() >= _OPEN_T
+                and not self.ref_spot):
+            return True, "market-open"
+
+        if now_ts - self.last_gen < OPT_GEN_MIN_GAP_SEC:
             return False, ""
         if not self.ref_spot:
             return True, "init"
 
         reasons: list[str] = []
-        if now - self.last_gen >= OPT_GEN_FLOOR_SEC:
+        if now_ts - self.last_gen >= OPT_GEN_FLOOR_SEC:
             reasons.append("floor")
         for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             cur, ref = spots.get(lbl), self.ref_spot.get(lbl)
@@ -183,6 +193,7 @@ class OptionGenTrigger:
 
     def commit(self, spots: dict) -> None:
         self.last_gen = time.time()
+        self.market_open_scanned = True
         for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             if spots.get(lbl):
                 self.ref_spot[lbl] = spots[lbl]
