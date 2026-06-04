@@ -152,7 +152,9 @@ _PAGE = """<!doctype html>
   .card .k{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.7px}
   .card .v{font-family:var(--mono);font-size:18px;font-weight:600;margin-top:3px}
   .card .sub{font-family:var(--mono);font-size:11px;margin-top:2px}
+  #open{margin-bottom:12px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+  @media(max-width:768px){.row{grid-template-columns:1fr}}
   .box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;min-height:0}
   .box.tall{height:60vh}
   .box.short{max-height:40vh}
