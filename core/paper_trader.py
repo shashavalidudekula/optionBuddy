@@ -49,6 +49,7 @@ from data.advisory_store import (
     open_paper_position,
     record_paper_equity,
     set_paper_position_last_price,
+    update_call_status,
 )
 
 log = get_logger("paper_trader")
@@ -235,12 +236,25 @@ class PaperTrader:
 
     # ── exits ─────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _t1_exit_fraction(category: str) -> float:
+        """Return the fraction of position to exit at T1 based on category.
+
+        Index options: exit 70% (keep 30% for T2)
+        Stocks/Futures: exit 60% (keep 40% for T2)
+        """
+        if category == "index_option":
+            return 0.7
+        return 0.6
+
     def _book_partial(self, call: dict, exit_price: float | None) -> str | None:
         pos = get_open_paper_position_by_call(call.get("id"))
         if not pos or exit_price is None:
             return None
         lot_size = int(pos["lot_size"])
-        partial_lots = math.floor(int(pos["lots"]) * PAPER_PARTIAL_FRACTION)
+        category = pos.get("category", "")
+        exit_fraction = self._t1_exit_fraction(category)
+        partial_lots = math.floor(int(pos["lots"]) * exit_fraction)
         exit_qty = partial_lots * lot_size
         remaining = int(pos["remaining_qty"])
         # Need a non-trivial partial that still leaves something on the table.
@@ -255,11 +269,18 @@ class PaperTrader:
             exit_qty=exit_qty, exit_price=round(exit_price, 2),
             realized_delta=realized, cash_delta=cash_delta, kind="partial", fully_closed=False,
         )
-        log.info("PAPER PARTIAL %s ×%s @ %.2f (pnl %.0f)", pos["instrument"], exit_qty, exit_price, realized)
+
+        # Trail stop-loss to breakeven (entry price) after T1 is booked
+        update_call_status(pos["call_id"], call.get("status", "entry_triggered"),
+                          stop_loss=entry)
+
+        log.info("PAPER PARTIAL %s ×%s @ %.2f (pnl %.0f) | SL trailed to breakeven ₹%.2f",
+                 pos["instrument"], exit_qty, exit_price, realized, entry)
         self._log_trade(pos, exit_qty, exit_price, realized, "partial")
         emoji = "🟢" if realized >= 0 else "🔴"
         return (f"💰 <b>PAPER T1</b> booked {exit_qty} of <b>{pos['instrument']}</b> "
-                f"@ ₹{exit_price:,.2f} {emoji} ₹{realized:,.0f}")
+                f"@ ₹{exit_price:,.2f} {emoji} ₹{realized:,.0f}\n"
+                f"🛑 SL trailed to breakeven (₹{entry:,.2f})")
 
     def _close(self, call: dict, exit_price: float | None, kind: str) -> str | None:
         pos = get_open_paper_position_by_call(call.get("id"))
