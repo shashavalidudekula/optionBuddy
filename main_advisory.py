@@ -58,6 +58,9 @@ log = get_logger("advisory_main")
 
 # Don't start broadcasting the morning briefing before this time.
 BRIEFING_AFTER = dtime(8, 30)
+# Pre-market scan at 9:08 AM (market opens at 9:15, pre-market closes at 9:08).
+# This gives 7 minutes to prepare for opening-level breakouts.
+PREMARKET_SCAN = dtime(9, 8)
 # Run the EOD digest after the market closes.
 EOD_AFTER = dtime(15, 35)
 
@@ -67,6 +70,7 @@ def _parse_hhmm(s: str) -> dtime:
     return dtime(int(hh), int(mm))
 
 
+_PREMARKET_T = PREMARKET_SCAN
 _OPEN_T = _parse_hhmm(MARKET_OPEN)
 _CLOSE_T = _parse_hhmm(MARKET_CLOSE)
 
@@ -294,15 +298,31 @@ async def run() -> None:
     other_categories = [c for c in CATEGORIES if c != "index_option"]
     last_other_gen: datetime | None = None
     briefing_date = None
+    premarket_date = None
     eod_date = None
 
-    log.info("Advisory orchestrator started (poll=%ss, options=event-driven, others=%smin)",
+    log.info("Advisory orchestrator started (poll=%ss, premarket=9:08, options=event-driven, others=%smin)",
              POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN)
 
     try:
         while True:
             now = datetime.now()
             today = now.date()
+
+            # Pre-market scan at 9:08 AM — generate calls based on opening levels.
+            # Market opens at 9:15, so this gives 7 minutes to prepare for opening breakouts.
+            if (_is_weekday(now) and now.time() >= _PREMARKET_T and premarket_date != today
+                    and session is not None):
+                try:
+                    await run_generation_cycle(bot, session, ["index_option"])
+                    await bot.notify_owner(
+                        "🚀 <b>Pre-market scan complete!</b>\n"
+                        "Setups ready for 9:15 AM open. Get ready to move."
+                    )
+                    log.info("Pre-market option scan completed")
+                except Exception as e:
+                    log.error("Pre-market generation failed: %s", e)
+                premarket_date = today
 
             # Morning briefing — once per trading day.
             if (_is_weekday(now) and now.time() >= BRIEFING_AFTER
