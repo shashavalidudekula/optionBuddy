@@ -142,16 +142,19 @@ async def run_generation_cycle(bot: TelegramAdvisoryBot, session, categories) ->
 
 
 class OptionGenTrigger:
-    """Decides when to re-scan index options — on real market moves, not a timer.
+    """Adaptive time-based scanning for options — maximum responsiveness to reversals.
 
-    Fires when an index moves >= GEN_MOVE_PCT, crosses into a new ATM strike, or
-    India VIX jumps >= GEN_VIX_JUMP_PCT since the last scan; plus a floor so we
-    scan at least every OPT_GEN_FLOOR_SEC, and a cooldown so we never scan more
-    often than OPT_GEN_MIN_GAP_SEC.
+    Scanning intervals (time-of-day aware):
+      9:15–9:45 AM: 1-2 sec   (peak opening volatility, catch ALL reversals)
+      9:45–10:30 AM: 20 sec   (still volatile, need quick response)
+      10:30 AM–12:00 PM: 45 sec  (mid-morning, lower volatility)
+      12:00–1:00 PM: 30 sec   (lunch volatility spike)
+      1:00–3:30 PM: 10 sec    (afternoon session, moderate volatility)
 
-    Forces an immediate scan at market open (9:15 AM) to catch early breakouts.
-    Also force-refreshes calls every 20 minutes during market hours to prevent
-    stale calls (e.g. 9:15 bearish calls still active at 9:45 when market reverses).
+    Reversal trigger: 0.25% (immediate rescan if market reverses)
+
+    Prevents stale calls at all times. Example: 9:15 bearish scan → 9:16 market
+    reverses 0.25% → immediate 9:16:05 rescan sees bullish setup → buys CALLS.
     """
 
     def __init__(self):
@@ -160,7 +163,7 @@ class OptionGenTrigger:
         self.ref_atm: dict[str, float] = {}
         self.ref_vix: float | None = None
         self.market_open_scanned = False
-        self.call_refresh_interval = 20 * 60  # Force refresh every 20 mins
+        self.reversal_threshold = 0.25  # 0.25% reversal triggers immediate rescan
 
     @staticmethod
     def _atm(index: str, spot: float | None) -> float | None:
@@ -168,6 +171,32 @@ class OptionGenTrigger:
         if not step or not spot:
             return None
         return round(spot / step) * step
+
+    @staticmethod
+    def _get_scan_interval(now: datetime) -> float:
+        """Return scan interval in seconds based on time of day (market volatility)."""
+        hour = now.hour
+        minute = now.minute
+        time_mins = hour * 60 + minute
+
+        # 9:15–9:45 AM: 1-2 sec (peak opening volatility)
+        if dtime(9, 15) <= now.time() <= dtime(9, 45):
+            return 1.5
+        # 9:45–10:30 AM: 20 sec (still volatile)
+        elif dtime(9, 45) < now.time() <= dtime(10, 30):
+            return 20
+        # 10:30 AM–12:00 PM: 45 sec (mid-morning)
+        elif dtime(10, 30) < now.time() <= dtime(12, 0):
+            return 45
+        # 12:00–1:00 PM: 30 sec (lunch volatility)
+        elif dtime(12, 0) < now.time() <= dtime(13, 0):
+            return 30
+        # 1:00–3:30 PM: 10 sec (afternoon)
+        elif dtime(13, 0) < now.time() <= dtime(15, 30):
+            return 10
+        # Default fallback (outside trading hours)
+        else:
+            return 60
 
     def check(self, spots: dict) -> tuple[bool, str]:
         now = datetime.now()
@@ -178,30 +207,37 @@ class OptionGenTrigger:
                 and not self.ref_spot):
             return True, "market-open"
 
-        if now_ts - self.last_gen < OPT_GEN_MIN_GAP_SEC:
+        # Adaptive time-based scanning interval (faster during volatile hours)
+        scan_interval = self._get_scan_interval(now)
+        if now_ts - self.last_gen < scan_interval:
             return False, ""
+
         if not self.ref_spot:
             return True, "init"
 
         reasons: list[str] = []
 
-        # Time-based refresh: force rescan every 20 minutes to prevent stale calls.
-        # (e.g. 9:15 bearish calls shouldn't still be active at 9:45 if market reversed)
-        if now_ts - self.last_gen >= self.call_refresh_interval:
-            reasons.append("refresh")
-        elif now_ts - self.last_gen >= OPT_GEN_FLOOR_SEC:
-            reasons.append("floor")
-
+        # Check for reversals (0.25% threshold) — trigger immediate rescan.
+        # Example: 9:15 bearish scan, 9:16 market reverses 0.25% → rescan immediately.
         for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             cur, ref = spots.get(lbl), self.ref_spot.get(lbl)
-            if cur and ref and abs(cur - ref) / ref * 100 >= GEN_MOVE_PCT:
-                reasons.append(f"{idx} {(cur - ref) / ref * 100:+.2f}%")
+            if cur and ref:
+                pct_move = abs(cur - ref) / ref * 100
+                # Reversal: moved 0.25%+ in any direction
+                if pct_move >= self.reversal_threshold:
+                    reasons.append(f"{idx} reversal {pct_move:+.2f}%")
+                # Regular movement trigger
+                if pct_move >= GEN_MOVE_PCT:
+                    reasons.append(f"{idx} move {(cur - ref) / ref * 100:+.2f}%")
+            # ATM strike changed
             atm, ratm = self._atm(idx, cur), self.ref_atm.get(lbl)
             if atm and ratm and atm != ratm:
                 reasons.append(f"{idx} ATM→{int(atm)}")
+
         vix = spots.get("indiavix")
         if vix and self.ref_vix and abs(vix - self.ref_vix) / self.ref_vix * 100 >= GEN_VIX_JUMP_PCT:
             reasons.append(f"VIX {(vix - self.ref_vix) / self.ref_vix * 100:+.1f}%")
+
         return (bool(reasons), ", ".join(reasons))
 
     def commit(self, spots: dict) -> None:
