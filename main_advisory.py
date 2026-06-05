@@ -150,6 +150,8 @@ class OptionGenTrigger:
     often than OPT_GEN_MIN_GAP_SEC.
 
     Forces an immediate scan at market open (9:15 AM) to catch early breakouts.
+    Also force-refreshes calls every 20 minutes during market hours to prevent
+    stale calls (e.g. 9:15 bearish calls still active at 9:45 when market reverses).
     """
 
     def __init__(self):
@@ -158,6 +160,7 @@ class OptionGenTrigger:
         self.ref_atm: dict[str, float] = {}
         self.ref_vix: float | None = None
         self.market_open_scanned = False
+        self.call_refresh_interval = 20 * 60  # Force refresh every 20 mins
 
     @staticmethod
     def _atm(index: str, spot: float | None) -> float | None:
@@ -181,8 +184,14 @@ class OptionGenTrigger:
             return True, "init"
 
         reasons: list[str] = []
-        if now_ts - self.last_gen >= OPT_GEN_FLOOR_SEC:
+
+        # Time-based refresh: force rescan every 20 minutes to prevent stale calls.
+        # (e.g. 9:15 bearish calls shouldn't still be active at 9:45 if market reversed)
+        if now_ts - self.last_gen >= self.call_refresh_interval:
+            reasons.append("refresh")
+        elif now_ts - self.last_gen >= OPT_GEN_FLOOR_SEC:
             reasons.append("floor")
+
         for lbl, idx in (("nifty", "NIFTY"), ("banknifty", "BANKNIFTY"), ("sensex", "SENSEX")):
             cur, ref = spots.get(lbl), self.ref_spot.get(lbl)
             if cur and ref and abs(cur - ref) / ref * 100 >= GEN_MOVE_PCT:
