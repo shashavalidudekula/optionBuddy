@@ -79,6 +79,7 @@ EVENT_LABEL = {
     "target_hit": "✅ Target hit — call closed",
     "sl_hit": "🛑 Stop-loss hit — call closed",
     "expired": "⌛ Call expired",
+    "invalidated": "🔄 Trend reversed — call cut early",
 }
 
 
@@ -161,66 +162,54 @@ def _num(v, default=0.0) -> float:
 
 
 def _fetch_open_closed() -> tuple[list[dict], list[dict]]:
-    """Fetch live positions from INDStocks → (open, closed) normalized dicts.
+    """Fetch live broker positions (active provider) → (open, closed) dicts.
 
     Read-only portfolio view — NO execution. Builds a fresh session each call so
-    it always uses the current token (INDStocks tokens expire ~daily). Raises
-    IndStocksAuthError on HTTP 401 (expired/invalid token); other failures
+    it always uses the current token (broker tokens expire ~daily). Field names
+    are alias-tolerant so both INDStocks (snake_case) and Dhan (camelCase) parse.
+    Raises IndStocksAuthError on an expired/invalid token; other failures
     propagate to the caller.
     """
     import requests
-    from core.indstocks_auth import IndStocksSession
+    from core.market_data_provider import get_session, get_positions
 
     try:
-        session = IndStocksSession()
-        resp = session.get(
-            "/portfolio/positions",
-            params={"segment": "derivative", "product": "margin"},
-        )
+        positions = get_positions(get_session())
     except requests.HTTPError as e:
         if getattr(e.response, "status_code", None) == 401:
             raise IndStocksAuthError() from e
         raise
-
-    # Unwrap the response envelope ({"data": {...|[...]}} or a bare list).
-    if isinstance(resp, list):
-        positions = resp
-    else:
-        data = resp.get("data", []) if isinstance(resp, dict) else []
-        if isinstance(data, dict):
-            positions = data.get("net_positions", data.get("positions", []))
-        elif isinstance(data, list):
-            positions = data
-        else:
-            positions = []
+    except ValueError as e:  # provider get_session() rejected an invalid/expired token
+        raise IndStocksAuthError() from e
 
     open_pos: list[dict] = []
     closed_pos: list[dict] = []
     for p in positions:
         if not isinstance(p, dict):
             continue
-        qty = int(_num(_first(p, "net_qty", "net_quantity", default=0)))
-        sym = _first(p, "symbol", "trading_symbol", "custom_symbol", default="?")
-        strike = _first(p, "drv_strike_price", "strike_price")
-        opt = _first(p, "drv_option_type", "option_type")
+        qty = int(_num(_first(p, "net_qty", "net_quantity", "netQty", default=0)))
+        sym = _first(p, "symbol", "trading_symbol", "custom_symbol",
+                     "tradingSymbol", "customSymbol", default="?")
+        strike = _first(p, "drv_strike_price", "strike_price", "drvStrikePrice")
+        opt = _first(p, "drv_option_type", "option_type", "drvOptionType")
         label = f"{sym}{strike}{opt}" if strike and opt else sym
 
         if qty != 0:
-            upnl_raw = _first(p, "pnl_absolute", "unrealized_profit", "unrealised")
+            upnl_raw = _first(p, "pnl_absolute", "unrealized_profit", "unrealised", "unrealizedProfit")
             open_pos.append({
                 "label": label,
                 "direction": "LONG" if qty > 0 else "SHORT",
                 "qty": abs(qty),
-                "avg_price": _num(_first(p, "avg_price", "buy_avg", "net_avg_price")),
-                "ltp": _num(_first(p, "ltp", "last_price", "live_price", "last_traded_price")),
+                "avg_price": _num(_first(p, "avg_price", "buy_avg", "net_avg_price", "buyAvg", "costPrice")),
+                "ltp": _num(_first(p, "ltp", "last_price", "live_price", "last_traded_price", "lastTradedPrice")),
                 "unrealised": _num(upnl_raw) if upnl_raw is not None else None,
             })
         else:
             closed_pos.append({
                 "label": label,
-                "buy_avg": _num(_first(p, "buy_avg")),
-                "sell_avg": _num(_first(p, "sell_avg")),
-                "realised": _num(_first(p, "realized_profit", "realised_profit", "realized")),
+                "buy_avg": _num(_first(p, "buy_avg", "buyAvg")),
+                "sell_avg": _num(_first(p, "sell_avg", "sellAvg")),
+                "realised": _num(_first(p, "realized_profit", "realised_profit", "realized", "realizedProfit")),
             })
     return open_pos, closed_pos
 
@@ -286,8 +275,7 @@ def build_position_review() -> str:
     """Fetch open positions + market context, ask Gemini for a next-session plan."""
     import html
 
-    from core.indstocks_auth import IndStocksSession
-    from core.indstocks_data import get_market_snapshot
+    from core.market_data_provider import get_session, get_market_snapshot
     from data.news_fetcher import get_top_headlines
     from core.llm import LLMQuotaError
     from signals.position_advisor import review_positions
@@ -305,7 +293,7 @@ def build_position_review() -> str:
 
     # Market context is best-effort — the review still works on positions alone.
     try:
-        market = get_market_snapshot(IndStocksSession())
+        market = get_market_snapshot(get_session())
     except Exception as e:  # noqa: BLE001
         log.warning("Review market snapshot failed: %s", e)
         market = {}
@@ -604,10 +592,9 @@ def build_calls_report(category: str | None = None) -> str:
     # Best-effort live prices (degrade silently if the data feed is unavailable).
     price_of: dict = {}
     try:
-        from core.indstocks_auth import IndStocksSession
-        from core.indstocks_data import make_price_lookup, _load_master
-        session = IndStocksSession()
-        _load_master(session)  # ensure scrip resolution works even before first gen
+        from core.market_data_provider import get_session, make_price_lookup, warm_instruments
+        session = get_session()
+        warm_instruments(session)  # ensure scrip resolution works even before first gen
         lookup = make_price_lookup(session)
         for c in calls:
             try:

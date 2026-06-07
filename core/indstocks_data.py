@@ -446,6 +446,19 @@ def get_lot_size(session, underlying: str) -> int | None:
     return PAPER_LOT_SIZES.get(u)
 
 
+def get_positions(session) -> list[dict]:
+    """Live broker positions (raw rows) for the read-only portfolio view."""
+    if session is None:
+        return []
+    resp = session.get("/portfolio/positions", params={"segment": "derivative", "product": "margin"})
+    if isinstance(resp, list):
+        return resp
+    data = resp.get("data", []) if isinstance(resp, dict) else []
+    if isinstance(data, dict):
+        return data.get("net_positions", data.get("positions", []))
+    return data if isinstance(data, list) else []
+
+
 def make_price_lookup(session):
     """Return `price_lookup(call) -> float | None` backed by INDstocks LTP."""
     cache: dict[str, tuple[float, float]] = {}

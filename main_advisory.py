@@ -42,8 +42,9 @@ from data.advisory_store import (
 from signals.advisory_engine import generate_calls
 from core.call_tracker import track_active_calls
 from core.paper_trader import PaperTrader
-from core.indstocks_auth import get_session
-from core.indstocks_data import (
+from core.execution import get_broker
+from core.market_data_provider import (
+    get_session,
     get_market_snapshot, make_price_lookup, get_option_chain, get_index_spots,
     option_expiry_for,
 )
@@ -319,13 +320,13 @@ async def run() -> None:
     init_advisory_db()
     log.info("Advisory DB ready")
 
-    # INDstocks is the live market-data feed (data only — no execution).
+    # Live market-data feed (provider chosen by MARKET_DATA_PROVIDER; data only).
     try:
         session = get_session()
     except Exception as e:
         session = None
-        log.error("INDstocks session unavailable (%s). Running with global cues only; "
-                  "option/equity tracking will rely on expiry until a token is set.", e)
+        log.error("Market-data session unavailable (%s). Running with global cues only; "
+                  "option/equity tracking will rely on expiry until credentials are set.", e)
 
     bot = TelegramAdvisoryBot()
     await bot.start_polling()
@@ -335,7 +336,9 @@ async def run() -> None:
     paper: PaperTrader | None = None
     if PAPER_TRADING_ENABLED:
         try:
-            paper = PaperTrader(session)
+            # Broker routes orders only in EXECUTION_MODE=live (and still double-guarded);
+            # in paper mode it's a no-op, so simulation behaviour is unchanged.
+            paper = PaperTrader(session, broker=get_broker(session))
         except Exception as e:
             log.error("Paper trader init failed (%s); continuing without it.", e)
 

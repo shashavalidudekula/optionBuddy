@@ -6,9 +6,47 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# -- INDstocks ----------------------------------------------------------------
+# -- Market-data provider -----------------------------------------------------
+# Which live feed powers the snapshot, option chains and price tracking:
+#   "dhan"      → DhanHQ v2 (native greeks/IV/OI; default — we trade on Dhan)
+#   "indstocks" → INDstocks (legacy fallback; LTP + instruments only)
+# Everything goes through core/market_data_provider.py, so dropping INDstocks
+# later is: delete core/indstocks_*.py + remove the one branch in that facade.
+MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "dhan").lower()
+
+# -- Dhan (DhanHQ v2) ---------------------------------------------------------
+# Auth = client-id + access-token headers. The access token is regenerated daily;
+# with an API key + TOTP it can be auto-refreshed (see core/dhan_auth.py).
+DHAN_CLIENT_ID     = os.getenv("DHAN_CLIENT_ID", "")
+DHAN_ACCESS_TOKEN  = os.getenv("DHAN_ACCESS_TOKEN", "")
+DHAN_BASE_URL      = os.getenv("DHAN_BASE_URL", "https://api.dhan.co/v2")
+DHAN_SCRIP_MASTER_URL = os.getenv(
+    "DHAN_SCRIP_MASTER_URL", "https://images.dhan.co/api-data/api-scrip-master.csv")
+# Underlying → (security_id, segment) for the option-chain endpoint. Dhan indices
+# live in the IDX_I segment. Equity/future underlyings are resolved from the scrip
+# master at runtime, so only indices need seeding here. Verify these ids against
+# the scrip master for your account before going live.
+DHAN_INDEX_UNDERLYINGS = {
+    "NIFTY":      (13, "IDX_I"),
+    "BANKNIFTY":  (25, "IDX_I"),
+    "FINNIFTY":   (27, "IDX_I"),
+    "MIDCPNIFTY": (442, "IDX_I"),
+    "SENSEX":     (51, "IDX_I"),
+    "BANKEX":     (69, "IDX_I"),
+    "INDIAVIX":   (21, "IDX_I"),
+}
+
+# -- INDstocks (legacy fallback — see MARKET_DATA_PROVIDER) --------------------
 INDSTOCKS_ACCESS_TOKEN = os.getenv("INDSTOCKS_ACCESS_TOKEN", "")
 INDSTOCKS_BASE_URL     = os.getenv("INDSTOCKS_BASE_URL", "https://api.indstocks.com")
+
+# -- Execution mode -----------------------------------------------------------
+# "paper" → simulated only (zero real money). "live" → route real Dhan orders.
+# DOUBLE GUARD: live orders are sent ONLY when EXECUTION_MODE=live AND
+# DHAN_ALLOW_LIVE_ORDERS=true. With the mode flipped but the guard off, the
+# live broker stays inert (logs + no-ops) so you can dry-run the wiring safely.
+EXECUTION_MODE        = os.getenv("EXECUTION_MODE", "paper").lower()
+DHAN_ALLOW_LIVE_ORDERS = os.getenv("DHAN_ALLOW_LIVE_ORDERS", "false").lower() == "true"
 
 # -- LLM provider -------------------------------------------------------------
 # Which backend powers call generation + position review: "azure" | "openai" | "gemini".
@@ -83,6 +121,16 @@ GEN_VIX_JUMP_PCT      = float(os.getenv("GEN_VIX_JUMP_PCT", "3.0"))    # India V
 OTHER_GEN_INTERVAL_MIN = int(os.getenv("OTHER_GEN_INTERVAL_MIN", "15"))
 # ATM strike step per index, for the "new ATM strike" trigger.
 ATM_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25, "SENSEX": 100}
+
+# -- Tape-alignment gate (don't fight the intraday trend) ---------------------
+# Reactive guard against "PUTs into a rally". Uses realized intraday momentum
+# (day move, 30-min momentum, 5-min EMA trend), never a prediction.
+#   Layer 2 (entry):  block new option/futures calls that fight a clear trend.
+#   Layer 3 (exit):   cut an open position when the underlying decisively reverses.
+TAPE_FILTER_ENABLED = os.getenv("TAPE_FILTER_ENABLED", "true").lower() == "true"
+TAPE_MIN_MOVE_PCT   = float(os.getenv("TAPE_MIN_MOVE_PCT", "0.25"))   # day move to call a trend (entry)
+TAPE_EXIT_ENABLED   = os.getenv("TAPE_EXIT_ENABLED", "true").lower() == "true"
+TAPE_EXIT_MOVE_PCT  = float(os.getenv("TAPE_EXIT_MOVE_PCT", "0.40"))  # stronger move to cut a held loser
 
 # -- Instruments (INDstocks security_ids) ------------------------------------
 TRACKED_INDICES    = os.getenv("TRACKED_INDICES", "13,25,1").split(",")      # Nifty50, BankNifty, VIX

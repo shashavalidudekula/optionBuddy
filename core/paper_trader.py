@@ -37,7 +37,8 @@ from config.settings import (
     PAPER_RISK_PCT,
     PAPER_START_CAPITAL,
 )
-from core.indstocks_data import get_lot_size, option_expiry_for
+from core.market_data_provider import get_lot_size, option_expiry_for
+from core.execution import PaperBroker
 from data.advisory_store import (
     book_paper_exit,
     compute_paper_equity,
@@ -120,12 +121,15 @@ def read_paper_day(date_str: str) -> dict:
 class PaperTrader:
     """Simulated trading account driven by call-tracker lifecycle events."""
 
-    def __init__(self, session=None):
+    def __init__(self, session=None, broker=None):
         self.session = session
+        # Broker is the real-order hook; PaperBroker is a no-op (simulation only).
+        # In live mode main passes a DhanBroker (still double-guarded).
+        self.broker = broker or PaperBroker()
         self.account = ensure_paper_account(PAPER_START_CAPITAL)
-        log.info("PaperTrader ready (capital ₹%.0f, risk %.0f%%, max %s open, scope %s)",
+        log.info("PaperTrader ready (capital ₹%.0f, risk %.0f%%, max %s open, scope %s, broker %s)",
                  PAPER_START_CAPITAL, PAPER_RISK_PCT * 100, PAPER_MAX_OPEN,
-                 ",".join(PAPER_CATEGORIES))
+                 ",".join(PAPER_CATEGORIES), type(self.broker).__name__)
 
     # ── event routing ─────────────────────────────────────────────────────────
 
@@ -148,6 +152,9 @@ class PaperTrader:
                     note = self._close(call, _f(call.get("stop_loss")), "stop")
                 elif et == "expired":
                     note = self._close(call, _f(evt.get("price")), "expiry")
+                elif et == "invalidated":
+                    # Layer 3: underlying reversed against us — cut at current premium.
+                    note = self._close(call, _f(evt.get("price")), "invalidated")
                 else:
                     note = None
             except Exception as e:  # noqa: BLE001
@@ -223,6 +230,10 @@ class PaperTrader:
         )
         log.info("PAPER OPEN %s %s ×%s @ %.2f (%s lot)", action, call.get("instrument"),
                  qty, price, lots)
+        try:  # real-order hook (no-op in paper; double-guarded in live)
+            self.broker.place_entry(call, action, qty, price)
+        except Exception as e:  # noqa: BLE001
+            log.error("Broker place_entry failed (%s): %s", call.get("instrument"), e)
 
         t1, t2, sl = _f(call.get("target_1")), _f(call.get("target_2")), _f(call.get("stop_loss"))
         targets = " / ".join(f"₹{t:,.2f}" for t in (t1, t2) if t is not None)
@@ -276,6 +287,10 @@ class PaperTrader:
 
         log.info("PAPER PARTIAL %s ×%s @ %.2f (pnl %.0f) | SL trailed to breakeven ₹%.2f",
                  pos["instrument"], exit_qty, exit_price, realized, entry)
+        try:  # real-order hook (no-op in paper; double-guarded in live)
+            self.broker.place_exit(call, action, exit_qty, exit_price, "partial")
+        except Exception as e:  # noqa: BLE001
+            log.error("Broker place_exit (partial) failed (%s): %s", pos["instrument"], e)
         self._log_trade(pos, exit_qty, exit_price, realized, "partial")
         emoji = "🟢" if realized >= 0 else "🔴"
         return (f"💰 <b>PAPER T1</b> booked {exit_qty} of <b>{pos['instrument']}</b> "
@@ -302,8 +317,16 @@ class PaperTrader:
         )
         log.info("PAPER CLOSE (%s) %s ×%s @ %.2f (pnl %.0f)", kind, pos["instrument"],
                  remaining, exit_price, realized)
+        try:  # real-order hook (no-op in paper; double-guarded in live)
+            self.broker.place_exit(
+                {"category": pos.get("category"), "underlying": pos.get("underlying"),
+                 "instrument": pos.get("instrument")},
+                action, remaining, exit_price, kind)
+        except Exception as e:  # noqa: BLE001
+            log.error("Broker place_exit (%s) failed (%s): %s", kind, pos["instrument"], e)
         self._log_trade(pos, remaining, exit_price, realized, kind)
-        label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY"}.get(kind, "PAPER CLOSE")
+        label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY",
+                 "invalidated": "🔄 PAPER CUT (trend reversed)"}.get(kind, "PAPER CLOSE")
         emoji = "✅" if realized >= 0 else "❌"
         return (f"{label} <b>{pos['instrument']}</b> ×{remaining} @ ₹{exit_price:,.2f} "
                 f"{emoji} ₹{realized:,.0f}")
