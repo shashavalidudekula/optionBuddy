@@ -152,12 +152,19 @@ def _compute_one(symbol: str, ticker: str) -> dict | None:
 
 
 def _trend_intraday(last: float, ema_fast: float | None, ema_slow: float | None) -> str:
+    """Intraday trend from the 9/21 EMA stack.
+
+    The EMA stack defines the bias; price-vs-SLOW-EMA is the break condition. This
+    way a shallow pullback below the fast EMA (but still above the slow EMA) stays
+    "up"/"down" instead of collapsing to "choppy" on every 5-minute wiggle — the
+    trend only breaks once price loses the slow EMA.
+    """
     if ema_fast is None or ema_slow is None:
         return "unknown"
-    if last > ema_fast > ema_slow:
-        return "up"
-    if last < ema_fast < ema_slow:
-        return "down"
+    if ema_fast > ema_slow:
+        return "up" if last >= ema_slow else "choppy"
+    if ema_fast < ema_slow:
+        return "down" if last <= ema_slow else "choppy"
     return "choppy"
 
 

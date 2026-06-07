@@ -19,6 +19,7 @@ from typing import Callable
 
 from config.logger import get_logger
 from data.advisory_store import get_active_calls, update_call_status
+from core.tape_filter import is_invalidated
 
 log = get_logger("call_tracker")
 
@@ -149,6 +150,30 @@ def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
             price = None
 
         if price is None:
+            continue
+
+        # Layer 3 — underlying invalidation: if the index has decisively reversed
+        # against this call's direction, cut it now at the current premium (better
+        # than riding a bearish position down to its stop while the market rallies).
+        try:
+            cut, why = is_invalidated(call)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Invalidation check failed for call #%s: %s", call["id"], e)
+            cut = False
+        if cut:
+            result = _pct(str(call["action"]).upper(), float(call["entry_price"]), float(price))
+            update_call_status(call["id"], "closed", last_price=float(price), result_pct=result)
+            log.info("Call #%s INVALIDATED @ %.2f (%s) — %s",
+                     call["id"], float(price), call["instrument"], why)
+            events.append({
+                "call_id": call["id"],
+                "instrument": call["instrument"],
+                "category": call["category"],
+                "event_type": "invalidated",
+                "price": float(price),
+                "result_pct": result,
+                "call": call,
+            })
             continue
 
         evt = _evaluate_call(call, float(price))

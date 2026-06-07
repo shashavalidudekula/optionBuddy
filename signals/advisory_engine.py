@@ -49,6 +49,15 @@ _CATEGORY_GUIDANCE = {
         "PREMIUMS in INR, "
         "not index points. Account for theta decay and IV. Prefer slightly OTM/ATM strikes "
         "with liquidity. Timeframe is usually 'intraday'.\n"
+        "DIRECTION RULE (critical — match the option type to the intraday trend of the UNDERLYING):\n"
+        "  • Confirmed UPTREND (intraday 'trend_5m' up, price above VWAP / above opening range, "
+        "positive 'momentum_30m_pct') → BUY a CALL (CE), or SELL a PUT (PE).\n"
+        "  • Confirmed DOWNTREND (trend down, below VWAP / below opening range, negative momentum) "
+        "→ BUY a PUT (PE), or SELL a CALL (CE).\n"
+        "  • NEVER buy a PUT (PE) while the index is trending UP, and NEVER buy a CALL (CE) while "
+        "it is trending DOWN. Do not fade an active intraday trend unless you cite a SPECIFIC, "
+        "named reversal signal (e.g. rejection at a stated resistance with momentum divergence) in "
+        "the rationale. When the tape is genuinely flat/choppy, it is fine to return no option calls.\n"
         "IMPORTANT: When an 'option_chain' is provided in the market snapshot, you MUST pick a "
         "strike that exists in it and set 'entry_price' at (or very close to) that strike's live "
         "'premium'. Derive 'target_1'/'target_2'/'stop_loss' from that live premium so the call "
@@ -228,6 +237,19 @@ def generate_calls(
             continue
 
         published.append(call)
+
+    # Layer 2 — tape gate: deterministically drop any call that fights a clear
+    # intraday trend (e.g. a bearish PE while the index is rallying). Reacts to the
+    # realized tape, never predicts. No-op unless TAPE_FILTER_ENABLED.
+    try:
+        from core.tape_filter import filter_calls as _tape_filter
+        before = len(published)
+        published = _tape_filter(published)
+        if len(published) != before:
+            log.info("Tape gate dropped %s of %s %s call(s)",
+                     before - len(published), before, category)
+    except Exception as e:  # noqa: BLE001
+        log.error("Tape gate skipped (%s); publishing unfiltered.", e)
 
     log.info("Generated %s publishable %s calls (from %s candidates)",
              len(published), category, len(raw_calls))
