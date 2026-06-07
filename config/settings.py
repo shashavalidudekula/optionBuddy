@@ -18,8 +18,17 @@ MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "dhan").lower()
 # Auth = client-id + access-token headers. The access token is regenerated daily;
 # with an API key + TOTP it can be auto-refreshed (see core/dhan_auth.py).
 DHAN_CLIENT_ID     = os.getenv("DHAN_CLIENT_ID", "")
-DHAN_ACCESS_TOKEN  = os.getenv("DHAN_ACCESS_TOKEN", "")
 DHAN_BASE_URL      = os.getenv("DHAN_BASE_URL", "https://api.dhan.co/v2")
+# Auto token generation (preferred): with TOTP enabled on the Dhan account, the
+# daily access token is generated headlessly from client-id + PIN + TOTP secret
+# (no manual copy). Secrets stay in .env (gitignored); the token lives in memory
+# only — never logged in full, never written to disk. See core/dhan_auth.py.
+DHAN_PIN           = os.getenv("DHAN_PIN", "")
+DHAN_TOTP_SECRET   = os.getenv("DHAN_TOTP_SECRET", "")
+DHAN_AUTH_BASE_URL = os.getenv("DHAN_AUTH_BASE_URL", "https://auth.dhan.co")
+# Optional static token — used only as a fallback when auto-generation isn't
+# configured (i.e. DHAN_PIN / DHAN_TOTP_SECRET are blank).
+DHAN_ACCESS_TOKEN  = os.getenv("DHAN_ACCESS_TOKEN", "")
 DHAN_SCRIP_MASTER_URL = os.getenv(
     "DHAN_SCRIP_MASTER_URL", "https://images.dhan.co/api-data/api-scrip-master.csv")
 # Underlying → (security_id, segment) for the option-chain endpoint. Dhan indices
