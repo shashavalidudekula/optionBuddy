@@ -95,8 +95,12 @@ def _evaluate_call(call: dict, price: float) -> dict | None:
                 update_call_status(call["id"], "target_hit", last_price=price,
                                    result_pct=_pct(action, entry, t1))
                 return event("target_hit", exit_price=t1)
+            # Trail the stop-loss to breakeven (entry) the moment T1 is hit, so the
+            # remaining position can only exit at profit (T2) or flat (breakeven) —
+            # never back at the original loss. Persisting it here means it works for
+            # every call, including single-lot paper positions that can't be split.
             update_call_status(call["id"], "target1_hit", last_price=price,
-                               result_pct=_pct(action, entry, t1))
+                               result_pct=_pct(action, entry, t1), stop_loss=entry)
             return event("target1_hit", exit_price=t1)
 
     # 4) Entry trigger (informational)

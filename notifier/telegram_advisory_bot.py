@@ -635,6 +635,7 @@ class TelegramAdvisoryBot:
         self.app.add_handler(CommandHandler("pnl", self._cmd_pnl))
         self.app.add_handler(CommandHandler("review", self._cmd_review))
         self.app.add_handler(CommandHandler("paper", self._cmd_paper))
+        self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CallbackQueryHandler(self._on_category_toggle, pattern=r"^cat:"))
 
@@ -753,6 +754,38 @@ class TelegramAdvisoryBot:
             report = await asyncio.to_thread(build_paper_report)
         await update.message.reply_text(report, parse_mode="HTML")
 
+    async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the active LLM / data feed / execution mode + scan cadence (owner only)."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /status is restricted to the account owner.")
+            return
+        from config.settings import (
+            LLM_PROVIDER, GEMINI_MODEL, OPENAI_MODEL, AZURE_OPENAI_DEPLOYMENT,
+            MARKET_DATA_PROVIDER, EXECUTION_MODE, DHAN_ALLOW_LIVE_ORDERS,
+            POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN, PAPER_TRADING_ENABLED,
+            PAPER_RISK_PCT, PAPER_MAX_OPEN, PAPER_PARTIAL_FRACTION, MIN_CONFIDENCE,
+        )
+        model = {"gemini": GEMINI_MODEL, "openai": OPENAI_MODEL,
+                 "azure": AZURE_OPENAI_DEPLOYMENT}.get(LLM_PROVIDER, "—")
+        if EXECUTION_MODE == "live":
+            exec_line = "live · ORDERS ON 🔴" if DHAN_ALLOW_LIVE_ORDERS else "live · dry-run (orders guarded)"
+        else:
+            exec_line = "paper (no real money)"
+        sell = int(PAPER_PARTIAL_FRACTION * 100)
+        lines = [
+            "🩺 <b>OptionBuddy status</b>",
+            f"• 🧠 LLM: <b>{LLM_PROVIDER}</b> — <code>{model}</code>",
+            f"• 📡 Market data: <b>{MARKET_DATA_PROVIDER}</b>",
+            f"• ⚙️ Execution: <b>{exec_line}</b>",
+            f"• 📝 Paper: {'on' if PAPER_TRADING_ENABLED else 'off'} · risk {PAPER_RISK_PCT * 100:.0f}% "
+            f"· max {PAPER_MAX_OPEN} open · min conf {MIN_CONFIDENCE}%",
+            f"• 🎯 T1 rule: book {sell}% / hold {100 - sell}% → SL to breakeven",
+            "• ⏱ Options scan: 09:15–09:45 ~1.5s · 09:45–10:30 20s · 10:30–12:00 45s "
+            "· 12:00–13:00 30s · 13:00–15:30 10s (+ instant on a 0.25% reversal)",
+            f"• ⏱ Tracking every {POLL_INTERVAL_SEC}s · equity/futures/commodity every {OTHER_GEN_INTERVAL_MIN}min",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "*OptionBuddy Advisory — Help*\n\n"
@@ -766,6 +799,7 @@ class TelegramAdvisoryBot:
             "• /review — AI plan for your open positions next session (owner only)\n"
             "• /paper — shadow account performance, no real money (owner only)\n"
             "    ↳ /paper YYYY/MM/DD — that date's results\n"
+            "• /status — active LLM, data feed & mode + scan cadence (owner only)\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
             parse_mode="Markdown",

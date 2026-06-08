@@ -283,8 +283,13 @@ def update_call_status(
     last_price: float | None = None,
     result_pct: float | None = None,
     entry_triggered: bool | None = None,
+    stop_loss: float | None = None,
 ) -> None:
-    """Update a call's lifecycle state. Sets closed_at when entering a terminal status."""
+    """Update a call's lifecycle state. Sets closed_at when entering a terminal status.
+
+    `stop_loss` lets the tracker trail the SL (e.g. to breakeven after T1) so the
+    new level drives subsequent exit evaluation.
+    """
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -300,6 +305,9 @@ def update_call_status(
         if entry_triggered is not None:
             fields.append("entry_triggered = %s")
             params.append(entry_triggered)
+        if stop_loss is not None:
+            fields.append("stop_loss = %s")
+            params.append(stop_loss)
         if status in CLOSED_STATUSES:
             fields.append("closed_at = %s")
             params.append(datetime.now())

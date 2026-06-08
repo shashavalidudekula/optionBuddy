@@ -102,7 +102,7 @@ PAPER_START_CAPITAL     = float(os.getenv("PAPER_START_CAPITAL", "100000"))
 PAPER_RISK_PCT          = float(os.getenv("PAPER_RISK_PCT", "0.02"))   # risk 2% of equity to stop
 PAPER_MAX_OPEN          = int(os.getenv("PAPER_MAX_OPEN", "4"))         # max concurrent positions
 PAPER_DAILY_LOSS_PCT    = float(os.getenv("PAPER_DAILY_LOSS_PCT", "0.04"))  # halt new entries for the day
-PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.5"))  # book this much at T1
+PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # book this much at T1 (60%); hold 40% for T2
 # Categories the paper trader will act on (start narrow: index options only).
 PAPER_CATEGORIES        = tuple(
     c.strip() for c in os.getenv("PAPER_CATEGORIES", "index_option").split(",") if c.strip()
