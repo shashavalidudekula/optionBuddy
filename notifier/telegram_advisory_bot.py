@@ -636,6 +636,7 @@ class TelegramAdvisoryBot:
         self.app.add_handler(CommandHandler("review", self._cmd_review))
         self.app.add_handler(CommandHandler("paper", self._cmd_paper))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("why", self._cmd_why))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CallbackQueryHandler(self._on_category_toggle, pattern=r"^cat:"))
 
@@ -786,6 +787,65 @@ class TelegramAdvisoryBot:
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    async def _cmd_why(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Explain a published call: the model's rationale + the inputs it saw (owner only)."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /why is restricted to the account owner.")
+            return
+        arg = (ctx.args[0] if getattr(ctx, "args", None) else "").lstrip("#").strip()
+        if not arg.isdigit():
+            await update.message.reply_text(
+                "Use <code>/why &lt;call_id&gt;</code> — e.g. <code>/why 252</code>.", parse_mode="HTML")
+            return
+        from data.decision_log import read_decision
+        rec = await asyncio.to_thread(read_decision, int(arg))
+        if not rec:
+            await update.message.reply_text(
+                f"ℹ️ No decision record for call #{arg} (only calls generated after this feature "
+                "shipped have one).")
+            return
+        await update.message.reply_text(self._format_why(rec), parse_mode="HTML")
+
+    @staticmethod
+    def _format_why(rec: dict) -> str:
+        i = rec.get("inputs", {}) or {}
+        lv = rec.get("levels", {}) or {}
+        d = i.get("daily") or {}
+        intr = i.get("intraday") or {}
+        cs = i.get("chosen_strike") or {}
+        macro = i.get("macro") or {}
+        lines = [
+            f"🔍 <b>Why #{rec.get('call_id')}</b> — {rec.get('action')} <b>{rec.get('instrument')}</b>",
+            f"Confidence: <b>{rec.get('confidence')}%</b> · {rec.get('ts')}",
+            f"💡 <b>Rationale:</b> {html.escape(str(rec.get('rationale') or '—'))}",
+            f"🎯 Entry {lv.get('entry')} · T1 {lv.get('t1')} · T2 {lv.get('t2')} · SL {lv.get('sl')}",
+            "",
+            "<b>Inputs at generation</b>",
+        ]
+        ctx_bits = []
+        if i.get("spot") is not None:
+            ctx_bits.append(f"spot {i['spot']}")
+        if i.get("pcr_oi") is not None:
+            ctx_bits.append(f"PCR(OI) {i['pcr_oi']}")
+        if ctx_bits:
+            lines.append("• " + " · ".join(ctx_bits))
+        if cs:
+            lines.append(f"• Strike: prem {cs.get('premium')} · Δ {cs.get('delta')} · "
+                         f"IV {cs.get('iv')} · OI {cs.get('oi')} · vol {cs.get('volume')}")
+        if d:
+            lines.append(f"• Daily: {d.get('trend')} · RSI {d.get('rsi14')} · "
+                         f"EMA20 {d.get('ema20')}/EMA50 {d.get('ema50')} · ATR {d.get('atr14')}")
+        if intr:
+            lines.append(f"• Intraday(5m): {intr.get('trend_5m')} · RSI {intr.get('rsi14_5m')} · "
+                         f"{intr.get('opening_range_state')} · mom30 {intr.get('momentum_30m_pct')}%")
+        if macro:
+            lines.append("• Macro: " + " · ".join(f"{k} {v}" for k, v in macro.items()))
+        hl = i.get("headlines") or []
+        if hl:
+            lines.append("• Headlines:")
+            lines += [f"   – {html.escape(str(h))}" for h in hl]
+        return "\n".join(lines)
+
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "*OptionBuddy Advisory — Help*\n\n"
@@ -800,6 +860,7 @@ class TelegramAdvisoryBot:
             "• /paper — shadow account performance, no real money (owner only)\n"
             "    ↳ /paper YYYY/MM/DD — that date's results\n"
             "• /status — active LLM, data feed & mode + scan cadence (owner only)\n"
+            "• /why &lt;id&gt; — why a call was taken + the inputs it saw (owner only)\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
             parse_mode="Markdown",

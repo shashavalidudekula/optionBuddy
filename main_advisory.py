@@ -130,6 +130,11 @@ def _generate_all_categories(session, categories, indices=None) -> list[tuple[di
                 log.error("save_call failed (%s): %s", call.get("instrument"), e)
                 continue
             saved.append((call, call_id))
+            try:  # audit the inputs + rationale behind this call (for /why)
+                from data.decision_log import log_decision
+                log_decision(call_id, call, cat_market, headlines)
+            except Exception as e:  # noqa: BLE001
+                log.debug("Decision log skipped (%s): %s", call.get("instrument"), e)
             exclude.add(call.get("instrument"))  # avoid dupes within this cycle
     return saved
 
