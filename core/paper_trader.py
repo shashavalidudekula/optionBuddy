@@ -33,6 +33,7 @@ from config.settings import (
     PAPER_CATEGORIES,
     PAPER_DAILY_LOSS_PCT,
     PAPER_MAX_OPEN,
+    PAPER_MIN_LOTS,
     PAPER_PARTIAL_FRACTION,
     PAPER_RISK_PCT,
     PAPER_START_CAPITAL,
@@ -127,8 +128,10 @@ class PaperTrader:
         # In live mode main passes a DhanBroker (still double-guarded).
         self.broker = broker or PaperBroker()
         self.account = ensure_paper_account(PAPER_START_CAPITAL)
-        log.info("PaperTrader ready (capital ₹%.0f, risk %.0f%%, max %s open, scope %s, broker %s)",
-                 PAPER_START_CAPITAL, PAPER_RISK_PCT * 100, PAPER_MAX_OPEN,
+        log.info("PaperTrader ready (capital ₹%.0f, risk %.0f%%, min %s lots, max open %s, "
+                 "scope %s, broker %s)",
+                 PAPER_START_CAPITAL, PAPER_RISK_PCT * 100, PAPER_MIN_LOTS,
+                 PAPER_MAX_OPEN if PAPER_MAX_OPEN > 0 else "unlimited",
                  ",".join(PAPER_CATEGORIES), type(self.broker).__name__)
 
     # ── event routing ─────────────────────────────────────────────────────────
@@ -180,7 +183,8 @@ class PaperTrader:
             return None
 
         # Guardrails ----------------------------------------------------------
-        if len(get_open_paper_positions()) >= PAPER_MAX_OPEN:
+        # PAPER_MAX_OPEN <= 0 → unlimited concurrent positions (capital is the only limit).
+        if PAPER_MAX_OPEN > 0 and len(get_open_paper_positions()) >= PAPER_MAX_OPEN:
             log.info("Paper NOT EXECUTED (max %s open): %s", PAPER_MAX_OPEN, call.get("instrument"))
             set_call_paper_status(call_id, "capped")
             return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
@@ -207,26 +211,26 @@ class PaperTrader:
             log.info("Paper skip (no lot size for %s): %s", underlying, call.get("instrument"))
             return None
 
-        # Position size: risk PAPER_RISK_PCT of equity to the stop, whole lots ---
+        # Position size: scale by risk (PAPER_RISK_PCT to the stop) but floor at the
+        # configured minimum lots, then cap by available capital.
         equity = compute_paper_equity()
         risk_budget = PAPER_RISK_PCT * equity
-        lots = math.floor(risk_budget / (per_unit_risk * lot_size))
-        if lots < 1:
-            log.info("Paper skip (1 lot risks > budget ₹%.0f): %s", risk_budget, call.get("instrument"))
-            return None
+        risk_lots = math.floor(risk_budget / (per_unit_risk * lot_size))
+        lots = max(PAPER_MIN_LOTS, risk_lots)  # every trade is at least PAPER_MIN_LOTS
 
         # Capital halt: a long costs premium/price × qty up front. If free cash
-        # can't fund even one lot, halt execution and log the call as unfunded.
+        # can't fund the minimum trade size, halt execution and log it as unfunded.
         cash = float(get_paper_account()["cash"])
         cost_per_lot = price * lot_size
         affordable = math.floor(cash / cost_per_lot) if cost_per_lot > 0 else 0
-        if affordable < 1:
-            log.info("Paper NOT EXECUTED (capital exhausted: free ₹%.0f < lot ₹%.0f): %s",
-                     cash, cost_per_lot, call.get("instrument"))
+        if affordable < PAPER_MIN_LOTS:
+            min_cost = PAPER_MIN_LOTS * cost_per_lot
+            log.info("Paper NOT EXECUTED (capital exhausted: free ₹%.0f < %s-lot min ₹%.0f): %s",
+                     cash, PAPER_MIN_LOTS, min_cost, call.get("instrument"))
             set_call_paper_status(call_id, "unfunded")
             return (f"⛔ <b>Not executed</b> · {call.get('instrument')}\n"
-                    f"Capital exhausted — free ₹{cash:,.0f} &lt; 1 lot ₹{cost_per_lot:,.0f}. "
-                    f"Call still logged & shown on the dashboard.")
+                    f"Capital exhausted — free ₹{cash:,.0f} &lt; {PAPER_MIN_LOTS}-lot min "
+                    f"₹{min_cost:,.0f}. Call still logged & shown on the dashboard.")
         lots = min(lots, affordable)
 
         qty = lots * lot_size

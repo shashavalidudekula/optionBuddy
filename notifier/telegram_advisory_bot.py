@@ -764,7 +764,7 @@ class TelegramAdvisoryBot:
             LLM_PROVIDER, GEMINI_MODEL, OPENAI_MODEL, AZURE_OPENAI_DEPLOYMENT,
             MARKET_DATA_PROVIDER, EXECUTION_MODE, DHAN_ALLOW_LIVE_ORDERS,
             POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN, PAPER_TRADING_ENABLED,
-            PAPER_RISK_PCT, PAPER_MAX_OPEN, PAPER_PARTIAL_FRACTION, MIN_CONFIDENCE,
+            PAPER_RISK_PCT, PAPER_MAX_OPEN, PAPER_MIN_LOTS, PAPER_PARTIAL_FRACTION, MIN_CONFIDENCE,
         )
         model = {"gemini": GEMINI_MODEL, "openai": OPENAI_MODEL,
                  "azure": AZURE_OPENAI_DEPLOYMENT}.get(LLM_PROVIDER, "—")
@@ -779,7 +779,8 @@ class TelegramAdvisoryBot:
             f"• 📡 Market data: <b>{MARKET_DATA_PROVIDER}</b>",
             f"• ⚙️ Execution: <b>{exec_line}</b>",
             f"• 📝 Paper: {'on' if PAPER_TRADING_ENABLED else 'off'} · risk {PAPER_RISK_PCT * 100:.0f}% "
-            f"· max {PAPER_MAX_OPEN} open · min conf {MIN_CONFIDENCE}%",
+            f"· min {PAPER_MIN_LOTS} lots · max open {PAPER_MAX_OPEN if PAPER_MAX_OPEN > 0 else '∞'} "
+            f"· min conf {MIN_CONFIDENCE}%",
             f"• 🎯 T1 rule: book {sell}% / hold {100 - sell}% → SL to breakeven",
             "• ⏱ Options scan: 09:15–09:45 ~1.5s · 09:45–10:30 20s · 10:30–12:00 45s "
             "· 12:00–13:00 30s · 13:00–15:30 10s (+ instant on a 0.25% reversal)",
