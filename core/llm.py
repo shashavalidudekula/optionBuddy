@@ -103,6 +103,11 @@ def _chat_completion(client, model: str, system, prompt, json_mode, max_tokens, 
         raise LLMQuotaError(f"LLM rate/quota limit: {str(e)[:160]}") from e
     except openai.APIError as e:  # APIStatusError, APIConnectionError, APITimeoutError, ...
         raise LLMError(f"LLM API error: {str(e)[:160]}") from e
+    u = getattr(resp, "usage", None)
+    if u:
+        log.info("LLM usage [%s]: prompt=%s completion=%s total=%s", model,
+                 getattr(u, "prompt_tokens", None), getattr(u, "completion_tokens", None),
+                 getattr(u, "total_tokens", None))
     return (resp.choices[0].message.content or "").strip()
 
 
@@ -123,6 +128,13 @@ def _gemini_generate(system, prompt, json_mode, max_tokens, temperature) -> str:
     cfg = dict(max_output_tokens=max_tokens, temperature=temperature)
     if json_mode:
         cfg["response_mime_type"] = "application/json"
+    # Disable "thinking" for these structured-JSON generations: thinking tokens
+    # bill at the output rate and can consume the max_output_tokens budget,
+    # producing empty/truncated calls. Guarded for SDKs without ThinkingConfig.
+    try:
+        cfg["thinking_config"] = genai.types.ThinkingConfig(thinking_budget=0)
+    except Exception:  # noqa: BLE001
+        pass
 
     delay = 2.0
     last = None
@@ -132,6 +144,13 @@ def _gemini_generate(system, prompt, json_mode, max_tokens, temperature) -> str:
                 model=GEMINI_MODEL, contents=full,
                 config=genai.types.GenerateContentConfig(**cfg),
             )
+            um = getattr(resp, "usage_metadata", None)
+            if um:
+                log.info("Gemini usage [%s]: prompt=%s output=%s thoughts=%s total=%s",
+                         GEMINI_MODEL, getattr(um, "prompt_token_count", None),
+                         getattr(um, "candidates_token_count", None),
+                         getattr(um, "thoughts_token_count", None),
+                         getattr(um, "total_token_count", None))
             return (resp.text or "").strip()
         except Exception as e:  # noqa: BLE001
             last = e

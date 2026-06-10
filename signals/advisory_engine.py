@@ -61,7 +61,12 @@ _CATEGORY_GUIDANCE = {
         "IMPORTANT: When an 'option_chain' is provided in the market snapshot, you MUST pick a "
         "strike that exists in it and set 'entry_price' at (or very close to) that strike's live "
         "'premium'. Derive 'target_1'/'target_2'/'stop_loss' from that live premium so the call "
-        "is realistic and trackable. Do not invent premiums that contradict the chain."
+        "is realistic and trackable. Do not invent premiums that contradict the chain.\n"
+        "Each option_chain underlying gives 'spot', 'expiry', 'pcr_oi' (put/call OI ratio: >1 = "
+        "put-heavy/supportive, <1 = call-heavy/overhead resistance) and 'strikes'. Each strike row: "
+        "'premium' (entry), 'delta' (prefer ~0.4–0.6 abs delta for directional intraday), 'iv' "
+        "(implied vol %), 'oi' and 'volume' (liquidity — prefer high-OI/high-volume strikes). Let "
+        "delta drive strike selection, IV gauge how rich the option is, and OI/PCR confirm positioning."
     ),
     "equity": (
         "Focus on liquid NSE cash stocks (large/mid cap), e.g. RELIANCE, HDFCBANK, TCS. Recommend "

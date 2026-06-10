@@ -86,25 +86,27 @@ def _in_market_hours(now: datetime) -> bool:
 
 # ── Work units (sync, run in threads) ─────────────────────────────────────────
 
-def _generate_all_categories(session, categories) -> list[tuple[dict, int]]:
-    """Generate + persist fresh calls for the given categories. Returns (call, id)."""
+def _generate_all_categories(session, categories, indices=None) -> list[tuple[dict, int]]:
+    """Generate + persist fresh calls for the given categories. Returns (call, id).
+
+    `indices` restricts the option_chain feed to the index(es) that actually
+    triggered the scan (token saving); None → all tracked indices (pre-market).
+    """
     headlines = get_top_headlines()
     market = get_market_snapshot(session)
     exclude = active_instruments()
+    idx_list = list(indices) if indices else ["NIFTY", "BANKNIFTY", "SENSEX"]
 
     saved: list[tuple[dict, int]] = []
     for cat in categories:
         cat_market = market
         if cat == "index_option" and session is not None:
-            # Ground option calls in real, tradeable premiums (nearest expiry, ATM±N).
+            # Ground option calls in real premiums — only for the index(es) that
+            # moved, so we don't ship 3 full chains every scan.
             try:
                 cat_market = {
                     **market,
-                    "option_chain": {
-                        "NIFTY": get_option_chain(session, "NIFTY"),
-                        "BANKNIFTY": get_option_chain(session, "BANKNIFTY"),
-                        "SENSEX": get_option_chain(session, "SENSEX"),
-                    },
+                    "option_chain": {u: get_option_chain(session, u) for u in idx_list},
                 }
             except Exception as e:
                 log.warning("Option-chain fetch failed: %s", e)
@@ -134,8 +136,8 @@ def _generate_all_categories(session, categories) -> list[tuple[dict, int]]:
 
 # ── Async cycles ──────────────────────────────────────────────────────────────
 
-async def run_generation_cycle(bot: TelegramAdvisoryBot, session, categories) -> None:
-    saved = await asyncio.to_thread(_generate_all_categories, session, categories)
+async def run_generation_cycle(bot: TelegramAdvisoryBot, session, categories, indices=None) -> None:
+    saved = await asyncio.to_thread(_generate_all_categories, session, categories, indices)
     for call, call_id in saved:
         await bot.push_new_call(call, call_id)
     if saved:
@@ -199,24 +201,27 @@ class OptionGenTrigger:
         else:
             return 60
 
-    def check(self, spots: dict) -> tuple[bool, str]:
+    def check(self, spots: dict) -> tuple[bool, str, set | None]:
+        """Return (fire, reason, indices). `indices` is the set of indices that
+        triggered (so generation can feed only their chains); None → all."""
         now = datetime.now()
         now_ts = time.time()
 
         # Force scan at market open (9:15 AM) to catch early breakouts
         if (not self.market_open_scanned and now.time() >= _OPEN_T
                 and not self.ref_spot):
-            return True, "market-open"
+            return True, "market-open", None
 
         # Adaptive time-based scanning interval (faster during volatile hours)
         scan_interval = self._get_scan_interval(now)
         if now_ts - self.last_gen < scan_interval:
-            return False, ""
+            return False, "", None
 
         if not self.ref_spot:
-            return True, "init"
+            return True, "init", None
 
         reasons: list[str] = []
+        triggered: set[str] = set()
 
         # Check for reversals (0.25% threshold) — trigger immediate rescan.
         # Example: 9:15 bearish scan, 9:16 market reverses 0.25% → rescan immediately.
@@ -227,19 +232,23 @@ class OptionGenTrigger:
                 # Reversal: moved 0.25%+ in any direction
                 if pct_move >= self.reversal_threshold:
                     reasons.append(f"{idx} reversal {pct_move:+.2f}%")
+                    triggered.add(idx)
                 # Regular movement trigger
                 if pct_move >= GEN_MOVE_PCT:
                     reasons.append(f"{idx} move {(cur - ref) / ref * 100:+.2f}%")
+                    triggered.add(idx)
             # ATM strike changed
             atm, ratm = self._atm(idx, cur), self.ref_atm.get(lbl)
             if atm and ratm and atm != ratm:
                 reasons.append(f"{idx} ATM→{int(atm)}")
+                triggered.add(idx)
 
         vix = spots.get("indiavix")
         if vix and self.ref_vix and abs(vix - self.ref_vix) / self.ref_vix * 100 >= GEN_VIX_JUMP_PCT:
             reasons.append(f"VIX {(vix - self.ref_vix) / self.ref_vix * 100:+.1f}%")
+            triggered |= {"NIFTY", "BANKNIFTY", "SENSEX"}  # VIX moves all
 
-        return (bool(reasons), ", ".join(reasons))
+        return (bool(reasons), ", ".join(reasons), triggered or None)
 
     def commit(self, spots: dict) -> None:
         self.last_gen = time.time()
@@ -395,10 +404,10 @@ async def run() -> None:
                     try:
                         spots = await asyncio.to_thread(get_index_spots, session)
                         if spots:
-                            fire, reason = opt_trigger.check(spots)
+                            fire, reason, idxs = opt_trigger.check(spots)
                             if fire:
                                 log.info("Option scan triggered (%s)", reason or "—")
-                                await run_generation_cycle(bot, session, ["index_option"])
+                                await run_generation_cycle(bot, session, ["index_option"], indices=idxs)
                                 opt_trigger.commit(spots)
                     except Exception as e:
                         log.error("Option generation failed: %s", e)

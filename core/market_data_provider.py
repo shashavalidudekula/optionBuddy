@@ -48,7 +48,7 @@ def make_price_lookup(session):
     return _impl.make_price_lookup(session)
 
 
-def get_option_chain(session, underlying, count: int = 6):
+def get_option_chain(session, underlying, count: int = 4):
     return _impl.get_option_chain(session, underlying, count)
 
 

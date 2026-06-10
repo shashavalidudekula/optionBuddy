@@ -231,17 +231,46 @@ def _nearest_expiry(session, underlying: str) -> str | None:
 
 # ── option chain (native greeks/IV/OI) ───────────────────────────────────────
 
-def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
-    """Nearest-expiry chain around ATM with live premiums + greeks/IV/OI.
+def _r(v, nd):
+    """Round to nd decimals, or None."""
+    try:
+        return round(float(v), nd)
+    except (TypeError, ValueError):
+        return None
 
-    Returns rows: {strike, option_type, scrip_code, premium, expiry,
-                   iv, oi, volume, delta, theta, gamma, vega}.
+
+def _compact_num(v):
+    """Compact large counts for the LLM feed: 3786445→'3.79M', 1625→'1.6K'.
+
+    Keeps the OI/volume signal while spending far fewer tokens than 7–9 digit ints.
+    """
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    a = abs(n)
+    if a >= 1e7:
+        return f"{n / 1e6:.0f}M"
+    if a >= 1e5:
+        return f"{n / 1e6:.2f}M"
+    if a >= 1e3:
+        return f"{n / 1e3:.1f}K"
+    return int(n) if n == int(n) else round(n, 1)
+
+
+def get_option_chain(session, underlying: str, count: int = 4) -> dict:
+    """Nearest-expiry chain around ATM, compacted for the LLM feed.
+
+    Returns: {spot, expiry, pcr_oi, strikes: [{strike, option_type, premium,
+              delta, iv, oi, volume}, ...]}.  pcr_oi = total PUT OI / total CALL
+              OI across the FULL chain. Internal scrip_code and the
+              theta/gamma/vega greeks are dropped to keep the prompt lean.
     """
     if session is None:
-        return []
+        return {}
     exp = _nearest_expiry(session, underlying)
     if not exp:
-        return []
+        return {}
     key = (_INDEX_ALIASES.get(underlying.upper().strip(), underlying.upper().strip()), exp)
     hit = _chain_cache.get(key)
     if hit and (time.time() - hit[1]) < _CHAIN_TTL_SEC:
@@ -249,20 +278,20 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
 
     scrip, seg = _underlying_scrip_seg(underlying)
     if not scrip:
-        return []
+        return {}
     try:
         resp = session.post("/optionchain", json={
             "UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": exp})
     except Exception as e:  # noqa: BLE001
         log.warning("Dhan optionchain failed for %s %s: %s", underlying, exp, e)
-        return []
+        return {}
 
     data = resp.get("data", {}) if isinstance(resp, dict) else {}
     spot = data.get("last_price")
     oc = data.get("oc", {}) or {}
-    fno_seg = _fno_segment_for(underlying)
 
     rows: list[dict] = []
+    ce_oi = pe_oi = 0.0
     for strike_str, legs in oc.items():
         try:
             strike = float(strike_str)
@@ -272,44 +301,51 @@ def get_option_chain(session, underlying: str, count: int = 6) -> list[dict]:
             leg = (legs or {}).get(ot_key)
             if not leg:
                 continue
-            sid = leg.get("security_id")
-            g = leg.get("greeks") or {}
+            oi = leg.get("oi")
+            try:
+                if ot == "CE":
+                    ce_oi += float(oi or 0)
+                else:
+                    pe_oi += float(oi or 0)
+            except (TypeError, ValueError):
+                pass
             rows.append({
                 "strike": strike,
                 "option_type": ot,
-                "scrip_code": f"{fno_seg}:{sid}" if sid else None,
-                "premium": leg.get("last_price"),
-                "expiry": exp,
-                "iv": leg.get("implied_volatility"),
-                "oi": leg.get("oi"),
-                "volume": leg.get("volume"),
-                "delta": g.get("delta"), "theta": g.get("theta"),
-                "gamma": g.get("gamma"), "vega": g.get("vega"),
+                "premium": _r(leg.get("last_price"), 2),
+                "delta": _r((leg.get("greeks") or {}).get("delta"), 2),
+                "iv": _r(leg.get("implied_volatility"), 1),
+                "oi": _compact_num(leg.get("oi")),
+                "volume": _compact_num(leg.get("volume")),
             })
-    # Stash the ATM reference so trimming works without re-fetching spot.
-    for r in rows:
-        r["_spot"] = spot
-    _chain_cache[key] = (rows, time.time())
-    return _trim_chain(rows, count)
+
+    full = {
+        "spot": _r(spot, 2),
+        "expiry": exp,
+        "pcr_oi": round(pe_oi / ce_oi, 2) if ce_oi else None,
+        "strikes": rows,
+    }
+    _chain_cache[key] = (full, time.time())
+    return _trim_chain(full, count)
 
 
-def _trim_chain(rows: list[dict], count: int) -> list[dict]:
-    """Trim to ATM±count strikes so prompts/feeds stay bounded."""
+def _trim_chain(chain: dict, count: int) -> dict:
+    """Trim a cached chain dict to ATM±count strikes so the feed stays bounded."""
+    rows = (chain or {}).get("strikes") or []
     if not rows:
-        return []
+        return chain or {}
     strikes = sorted({r["strike"] for r in rows if r["strike"] > 0})
-    spot = next((r.get("_spot") for r in rows if r.get("_spot")), None)
-    ref = spot or (strikes[len(strikes) // 2] if strikes else None)
+    ref = chain.get("spot") or (strikes[len(strikes) // 2] if strikes else None)
     wanted = set(strikes)
     if ref and strikes:
         atm = min(strikes, key=lambda s: abs(s - ref))
         idx = strikes.index(atm)
         lo, hi = max(0, idx - count), idx + count + 1
         wanted = set(strikes[lo:hi])
-    out = [{k: v for k, v in r.items() if k != "_spot"}
-           for r in rows if r["strike"] in wanted]
-    out.sort(key=lambda c: (c["strike"], c["option_type"]))
-    return out
+    trimmed = sorted((r for r in rows if r["strike"] in wanted),
+                     key=lambda c: (c["strike"], c["option_type"]))
+    return {"spot": chain.get("spot"), "expiry": chain.get("expiry"),
+            "pcr_oi": chain.get("pcr_oi"), "strikes": trimmed}
 
 
 # ── quotes (LTP) ──────────────────────────────────────────────────────────────
