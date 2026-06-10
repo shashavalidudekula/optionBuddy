@@ -35,17 +35,30 @@ def _pct(action: str, entry: float, exit_price: float) -> float:
     return round((entry - exit_price) / entry * 100, 2)  # SELL
 
 
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _in_entry_zone(action: str, price: float, call: dict) -> bool:
-    """Has price reached the recommended entry zone?"""
-    emin = call.get("entry_min")
-    emax = call.get("entry_max")
-    if emin is not None and emax is not None:
-        return float(emin) <= price <= float(emax)
-    # No zone given → consider entry triggered once price crosses entry_price
-    entry = float(call["entry_price"])
+    """Has price reached an acceptable entry?
+
+    BUY  → fill at or below entry_max — i.e. willing to pay up to your max. This
+           catches BOTH dips and momentum/breakout fills, instead of requiring the
+           premium to sit exactly inside [entry_min, entry_max] (which misses fast
+           moves between polls — the cause of no opening-window trades).
+    SELL → fill at or above entry_min.
+    Falls back to entry_price when the band isn't provided.
+    """
+    emin, emax = _f(call.get("entry_min")), _f(call.get("entry_max"))
+    entry = _f(call.get("entry_price"))
     if action == "BUY":
-        return price <= entry  # buy on dip to entry or better
-    return price >= entry      # sell on rise to entry or better
+        cap = emax if emax is not None else entry
+        return cap is not None and price <= cap
+    floor_ = emin if emin is not None else entry
+    return floor_ is not None and price >= floor_
 
 
 def _evaluate_call(call: dict, price: float) -> dict | None:

@@ -17,13 +17,32 @@ Every call is purely informational/advisory — no execution.
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, time as dtime
 
 from config.settings import MIN_CONFIDENCE
 from config.logger import get_logger
 from core.llm import generate, LLMError, LLMQuotaError
 
 log = get_logger("advisory_engine")
+
+# Opening window (IST): trade the opening-range breakout, not chop inside it.
+_OPENING_START = dtime(9, 15)
+_OPENING_END = dtime(9, 30)
+_OPENING_GUIDANCE = (
+    "\nOPENING-RANGE BREAKOUT — it is now the first 15 minutes (09:15–09:30), peak "
+    "volatility. The 'intraday' block gives 'opening_range_high' (ORH), "
+    "'opening_range_low' (ORL) and 'opening_range_state'. PRIORITISE opening-range "
+    "breakouts: BUY a CALL (CE) when the index breaks decisively ABOVE ORH with positive "
+    "'momentum_30m_pct'; BUY a PUT (PE) when it breaks BELOW ORL with negative momentum. "
+    "Do NOT fade while 'opening_range_state' is 'inside_OR' — wait for a clean break. Put "
+    "the stop just back inside the range, and quote 'entry_price'/'entry_max' at the live "
+    "premium (small buffer) so the order fills at market on the breakout."
+)
+
+
+def _is_opening_window() -> bool:
+    now = datetime.now()
+    return now.weekday() < 5 and _OPENING_START <= now.time() <= _OPENING_END
 
 # Back-compat: older modules import GeminiQuotaError from here.
 GeminiQuotaError = LLMQuotaError
@@ -195,6 +214,9 @@ def generate_calls(
     """
     exclude = exclude_instruments or set()
     system = _system_prompt(category)
+    # During 9:15–9:30, steer index options toward opening-range breakouts.
+    if category == "index_option" and _is_opening_window():
+        system += _OPENING_GUIDANCE
     user = _build_market_prompt(market_data, headlines)
 
     try:

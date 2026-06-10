@@ -382,17 +382,20 @@ async def run() -> None:
 
             # Pre-market scan at 9:08 AM — generate calls based on opening levels.
             # Market opens at 9:15, so this gives 7 minutes to prepare for opening breakouts.
-            if (_is_weekday(now) and now.time() >= _PREMARKET_T and premarket_date != today
-                    and session is not None):
+            # Pre-open heads-up only — NO generation here. Pre-open premiums are
+            # stale (prev close), so calls made now rarely fill at the real open.
+            # The first LIVE scan fires at 9:15 via the market-open trigger, and
+            # 9:15–9:30 runs an opening-range-breakout strategy (see advisory_engine).
+            if (_is_weekday(now) and now.time() >= _PREMARKET_T and premarket_date != today):
                 try:
-                    await run_generation_cycle(bot, session, ["index_option"])
                     await bot.notify_owner(
-                        "🚀 <b>Pre-market scan complete!</b>\n"
-                        "Setups ready for 9:15 AM open. Get ready to move."
+                        "🔔 <b>Market opens in ~7 min.</b>\n"
+                        "Watching the opening range — first LIVE setups fire right at "
+                        "9:15, with opening-range-breakout focus through 9:30."
                     )
-                    log.info("Pre-market option scan completed")
-                except Exception as e:
-                    log.error("Pre-market generation failed: %s", e)
+                    log.info("Pre-open heads-up sent")
+                except Exception as e:  # noqa: BLE001
+                    log.error("Pre-open heads-up failed: %s", e)
                 premarket_date = today
 
             # Morning briefing — once per trading day.
