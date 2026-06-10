@@ -27,6 +27,7 @@ from data.advisory_store import (
     get_paper_stats,
     get_open_paper_positions,
     get_closed_paper_positions,
+    get_not_executed_calls,
     get_call_levels,
 )
 
@@ -97,6 +98,7 @@ def _state() -> dict:
         "calls": {
             "active": [_row(c) for c in get_active_calls()],
             "closed": [_row(c) for c in get_closed_calls(80)],
+            "not_executed": [_row(c) for c in get_not_executed_calls(60)],
         },
     }
 
@@ -203,6 +205,7 @@ _PAGE = """<!doctype html>
     <div id="ledger"></div>
     <div id="closed"></div>
   </div>
+  <div id="notexec"></div>
 </main>
 <footer>Read-only mirror · advisory only, not investment advice · markets carry risk.</footer>
 
@@ -272,6 +275,8 @@ function render(s){
   const ret = st.total_return_pct;
   const cards = [
     ["Equity", r0(st.equity), arrowPct(ret)],
+    ["Free cash", r0(st.free_cash), null],
+    ["Deployed", r0(st.deployed_capital), null],
     ["Realised", r0(st.realized_pnl), null, sgn(st.realized_pnl)],
     ["Unrealised", r0(st.unrealized_pnl), null, sgn(st.unrealized_pnl)],
     ["Today", r0(st.today_realized), null, sgn(st.today_realized)],
@@ -324,6 +329,16 @@ function render(s){
       <td class="l">${esc(c.instrument)}</td><td>${arrowPct(c.result_pct)}</td>
       <td class="l">${tm(c.issued_at)}</td></tr>`)),
     'short', cc.length>40?('showing 40 of '+cc.length):'');
+
+  // Generated but NOT executed (capital exhausted / position cap / loss halt)
+  const REASON = {unfunded:"capital exhausted", capped:"max positions", halted_daily_loss:"daily-loss halt"};
+  const ne = s.calls.not_executed || [];
+  document.getElementById('notexec').innerHTML = capBox('Generated · Not Executed', 'no capital / limits', ne.length, tbl(
+    [{t:"Cat",l:1},{t:"Side"},{t:"Instrument",l:1},{t:"Reason"},{t:"Conf"},{t:"Time",l:1}],
+    ne.slice(0,40).map(c=>`<tr><td class="l mut">${CAT[c.category]||c.category}</td><td>${side(c.action)}</td>
+      <td class="l">${esc(c.instrument)}</td><td><span class="pill">${REASON[c.paper_status]||c.paper_status}</span></td>
+      <td>${c.confidence!=null?c.confidence+"%":"—"}</td><td class="l">${tm(c.issued_at)}</td></tr>`)),
+    'short', ne.length>40?('showing 40 of '+ne.length):'');
 
   applyTabs('opt'); applyTabs('oth');
 }

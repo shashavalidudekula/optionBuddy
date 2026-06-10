@@ -151,8 +151,12 @@ def init_advisory_db() -> None:
         cur.execute(CREATE_PAPER_ACCOUNT)
         cur.execute(CREATE_PAPER_POSITIONS)
         cur.execute(CREATE_PAPER_FILLS)
-        # Migration for pre-existing DBs that lack the option_expiry column.
+        # Migration for pre-existing DBs that lack newer columns.
         cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS option_expiry DATE")
+        # paper_status: how the paper engine treated this call —
+        #   'executed' | 'unfunded' (no free capital) | 'capped' (max open) |
+        #   'halted_daily_loss'. NULL = not a paper-scope call / not evaluated.
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS paper_status TEXT")
         for idx in INDEXES:
             cur.execute(idx)
         conn.commit()
@@ -449,6 +453,61 @@ def ensure_paper_account(starting_capital: float) -> dict:
         conn.close()
 
 
+def reset_paper_account(starting_capital: float) -> None:
+    """DESTRUCTIVE: wipe paper positions/fills + account and recreate fresh.
+
+    Used for a clean restart of the shadow account. Closed-trade history kept in
+    logs/paper_history.jsonl is untouched; old per-call paper_status flags are cleared.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM paper_fills")
+        cur.execute("DELETE FROM paper_positions")
+        cur.execute("DELETE FROM paper_account WHERE id = 1")
+        cur.execute(
+            """INSERT INTO paper_account (id, starting_capital, cash, realized_pnl, peak_equity)
+               VALUES (1, %s, %s, 0, %s)""",
+            (starting_capital, starting_capital, starting_capital),
+        )
+        cur.execute("UPDATE calls SET paper_status = NULL WHERE paper_status IS NOT NULL")
+        conn.commit()
+        log.warning("PAPER ACCOUNT RESET to ₹%.0f (positions + fills wiped).", starting_capital)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def set_call_paper_status(call_id: int, status: str) -> None:
+    """Record how the paper engine treated a call (executed / unfunded / capped / …)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE calls SET paper_status = %s WHERE id = %s", (status, call_id))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_not_executed_calls(limit: int = 60) -> list[dict]:
+    """Calls the paper engine generated but did NOT execute (capital/limits)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM calls WHERE paper_status IN "
+            "('unfunded', 'capped', 'halted_daily_loss') ORDER BY issued_at DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
 def get_paper_account() -> dict | None:
     conn = get_conn()
     cur = conn.cursor()
@@ -707,10 +766,12 @@ def get_paper_stats() -> dict:
 
     open_positions = get_open_paper_positions()
     unrealized = 0.0
+    deployed = 0.0  # capital locked in open long positions (premium/price × qty)
     for p in open_positions:
         price = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
         sign = 1 if str(p["action"]).upper() == "BUY" else -1
         unrealized += sign * int(p["remaining_qty"]) * (price - float(p["entry_price"]))
+        deployed += int(p["remaining_qty"]) * float(p["entry_price"])
 
     conn = get_conn()
     cur = conn.cursor()
@@ -726,6 +787,8 @@ def get_paper_stats() -> dict:
     return {
         "starting_capital": start,
         "cash": float(acct["cash"]),
+        "free_cash": float(acct["cash"]),
+        "deployed_capital": round(deployed, 2),
         "equity": equity,
         "total_return_pct": round((equity - start) / start * 100, 2) if start else 0.0,
         "realized_pnl": float(acct["realized_pnl"]),

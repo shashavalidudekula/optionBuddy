@@ -49,6 +49,7 @@ from data.advisory_store import (
     get_paper_today_realized,
     open_paper_position,
     record_paper_equity,
+    set_call_paper_status,
     set_paper_position_last_price,
 )
 
@@ -172,20 +173,29 @@ class PaperTrader:
         if get_open_paper_position_by_call(call_id):
             return None  # already holding this call
 
+        # Scope: long (BUY) only — no shorts/futures (those need a margin model).
+        action = str(call.get("action", "")).upper()
+        if action != "BUY":
+            log.info("Paper skip (SELL/short out of scope): %s", call.get("instrument"))
+            return None
+
         # Guardrails ----------------------------------------------------------
         if len(get_open_paper_positions()) >= PAPER_MAX_OPEN:
-            log.info("Paper skip (max %s open): %s", PAPER_MAX_OPEN, call.get("instrument"))
-            return None
+            log.info("Paper NOT EXECUTED (max %s open): %s", PAPER_MAX_OPEN, call.get("instrument"))
+            set_call_paper_status(call_id, "capped")
+            return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
+                    f"Max {PAPER_MAX_OPEN} positions open — capital tied up. Call still logged.")
         loss_limit = -PAPER_DAILY_LOSS_PCT * PAPER_START_CAPITAL
         if get_paper_today_realized() <= loss_limit:
-            log.info("Paper skip (daily loss limit ₹%.0f hit): %s", loss_limit, call.get("instrument"))
-            return None
+            log.info("Paper NOT EXECUTED (daily loss limit): %s", call.get("instrument"))
+            set_call_paper_status(call_id, "halted_daily_loss")
+            return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
+                    f"Daily loss limit ₹{abs(loss_limit):,.0f} hit — execution halted today.")
         if int(call.get("confidence") or 0) < MIN_CONFIDENCE:
             return None
 
-        action = str(call.get("action", "")).upper()
         stop = _f(call.get("stop_loss"))
-        if action not in ("BUY", "SELL") or stop is None:
+        if stop is None:
             return None
         per_unit_risk = abs(price - stop)
         if per_unit_risk <= 0:
@@ -205,17 +215,22 @@ class PaperTrader:
             log.info("Paper skip (1 lot risks > budget ₹%.0f): %s", risk_budget, call.get("instrument"))
             return None
 
-        # Cash cap for long premium (BUY): can't spend more cash than we have.
+        # Capital halt: a long costs premium/price × qty up front. If free cash
+        # can't fund even one lot, halt execution and log the call as unfunded.
         cash = float(get_paper_account()["cash"])
-        if action == "BUY":
-            affordable = math.floor(cash / (price * lot_size))
-            lots = min(lots, affordable)
-            if lots < 1:
-                log.info("Paper skip (insufficient cash ₹%.0f): %s", cash, call.get("instrument"))
-                return None
+        cost_per_lot = price * lot_size
+        affordable = math.floor(cash / cost_per_lot) if cost_per_lot > 0 else 0
+        if affordable < 1:
+            log.info("Paper NOT EXECUTED (capital exhausted: free ₹%.0f < lot ₹%.0f): %s",
+                     cash, cost_per_lot, call.get("instrument"))
+            set_call_paper_status(call_id, "unfunded")
+            return (f"⛔ <b>Not executed</b> · {call.get('instrument')}\n"
+                    f"Capital exhausted — free ₹{cash:,.0f} &lt; 1 lot ₹{cost_per_lot:,.0f}. "
+                    f"Call still logged & shown on the dashboard.")
+        lots = min(lots, affordable)
 
         qty = lots * lot_size
-        cash_delta = -qty * price if action == "BUY" else qty * price
+        cash_delta = -qty * price  # long: deploy premium/price up front
         open_paper_position(
             call_id=call_id,
             instrument=call.get("instrument"),
@@ -227,8 +242,9 @@ class PaperTrader:
             entry_price=round(price, 2),
             cash_delta=round(cash_delta, 2),
         )
-        log.info("PAPER OPEN %s %s ×%s @ %.2f (%s lot)", action, call.get("instrument"),
-                 qty, price, lots)
+        set_call_paper_status(call_id, "executed")
+        log.info("PAPER OPEN %s %s ×%s @ %.2f (%s lot, deployed ₹%.0f)", action,
+                 call.get("instrument"), qty, price, lots, qty * price)
         try:  # real-order hook (no-op in paper; double-guarded in live)
             self.broker.place_entry(call, action, qty, price)
         except Exception as e:  # noqa: BLE001

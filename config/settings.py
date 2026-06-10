@@ -103,10 +103,14 @@ PAPER_RISK_PCT          = float(os.getenv("PAPER_RISK_PCT", "0.02"))   # risk 2%
 PAPER_MAX_OPEN          = int(os.getenv("PAPER_MAX_OPEN", "4"))         # max concurrent positions
 PAPER_DAILY_LOSS_PCT    = float(os.getenv("PAPER_DAILY_LOSS_PCT", "0.04"))  # halt new entries for the day
 PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # book this much at T1 (60%); hold 40% for T2
-# Categories the paper trader will act on (start narrow: index options only).
+# Categories the paper trader will act on. Scope: long options + stocks only —
+# NO futures and NO short positions (those need a margin model; out of scope).
 PAPER_CATEGORIES        = tuple(
-    c.strip() for c in os.getenv("PAPER_CATEGORIES", "index_option").split(",") if c.strip()
+    c.strip() for c in os.getenv("PAPER_CATEGORIES", "index_option,equity").split(",") if c.strip()
 )
+# One-time destructive reset of the paper account on startup (wipes positions/
+# fills, restores PAPER_START_CAPITAL). Set true for one boot, then back to false.
+PAPER_RESET_ON_START    = os.getenv("PAPER_RESET_ON_START", "false").lower() == "true"
 # Fallback lot sizes when the instruments master is unavailable (SEBI revises these
 # periodically; the master is preferred when a session is present).
 PAPER_LOT_SIZES = {

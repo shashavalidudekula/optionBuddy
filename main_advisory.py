@@ -28,6 +28,7 @@ from datetime import datetime, time as dtime
 from config.logger import get_logger
 from config.settings import (
     POLL_INTERVAL_SEC, MARKET_OPEN, MARKET_CLOSE, PAPER_TRADING_ENABLED,
+    PAPER_RESET_ON_START, PAPER_START_CAPITAL,
     OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
     OTHER_GEN_INTERVAL_MIN, ATM_STEP,
 )
@@ -333,6 +334,14 @@ async def send_eod_summary(bot: TelegramAdvisoryBot) -> None:
 async def run() -> None:
     init_advisory_db()
     log.info("Advisory DB ready")
+
+    # One-time destructive reset of the paper account (set the flag for one boot).
+    if PAPER_RESET_ON_START:
+        from data.advisory_store import reset_paper_account
+        reset_paper_account(PAPER_START_CAPITAL)
+        log.warning("PAPER_RESET_ON_START=true — paper account reset to ₹%.0f. "
+                    "Set it back to false to avoid resetting on the next boot.",
+                    PAPER_START_CAPITAL)
 
     # Live market-data feed (provider chosen by MARKET_DATA_PROVIDER; data only).
     try:
