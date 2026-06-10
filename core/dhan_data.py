@@ -32,6 +32,7 @@ underlying-expiry, marketfeed is 1 req/s.
 import csv
 import io
 import re
+import threading
 import time
 from datetime import datetime, date
 
@@ -51,6 +52,13 @@ _PRICE_TTL_SEC = 4               # share a price within one ~5s poll, fresh next
 _CHAIN_TTL_SEC = 3               # optionchain limit is 1 req / 3s per underlying
 _EXPIRY_TTL_SEC = 3600           # expiry list changes at most daily
 _INSTRUMENTS_TTL_SEC = 6 * 3600  # refresh the scrip master a few times a day
+
+# Dhan quote API hard limit is 1 request/second. A process-wide throttle spaces
+# ALL marketfeed/ltp calls (index spots + price tracking, across worker threads)
+# so they don't 429 and silently drop ticks — dropped ticks would miss T1/SL exits.
+_LTP_MIN_INTERVAL = 1.05
+_ltp_lock = threading.Lock()
+_ltp_last_ts = 0.0
 
 # Index aliases → canonical key in DHAN_INDEX_UNDERLYINGS.
 _INDEX_ALIASES = {
@@ -306,6 +314,30 @@ def _trim_chain(rows: list[dict], count: int) -> list[dict]:
 
 # ── quotes (LTP) ──────────────────────────────────────────────────────────────
 
+def _marketfeed_ltp(session, grouped: dict) -> dict | None:
+    """POST /marketfeed/ltp under a process-wide 1 req/sec throttle, retrying 429.
+
+    Holding the lock across the throttle-sleep + POST serialises every quote call
+    in the process to ≤1/sec, which is what Dhan enforces.
+    """
+    global _ltp_last_ts
+    for attempt in range(3):
+        try:
+            with _ltp_lock:
+                wait = _LTP_MIN_INTERVAL - (time.time() - _ltp_last_ts)
+                if wait > 0:
+                    time.sleep(wait)
+                resp = session.post("/marketfeed/ltp", json=grouped)
+                _ltp_last_ts = time.time()
+            return resp
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 429 and attempt < 2:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            raise
+    return None
+
+
 def get_ltp(session, scrip_codes: list[str]) -> dict[str, float]:
     """Batched LTP for "<SEG>:<id>" scrip-codes → {scrip_code: last_price}."""
     out: dict[str, float] = {}
@@ -326,19 +358,20 @@ def get_ltp(session, scrip_codes: list[str]) -> dict[str, float]:
         if not grouped:
             continue
         try:
-            resp = session.post("/marketfeed/ltp", json=grouped)
-            data = resp.get("data", {}) if isinstance(resp, dict) else {}
-            for seg, byid in (data or {}).items():
-                for sid, payload in (byid or {}).items():
-                    price = payload.get("last_price") if isinstance(payload, dict) else payload
-                    code = back.get((seg, str(sid)))
-                    if code and price is not None:
-                        try:
-                            out[code] = float(price)
-                        except (TypeError, ValueError):
-                            pass
+            resp = _marketfeed_ltp(session, grouped)
         except Exception as e:  # noqa: BLE001
             log.warning("Dhan LTP fetch failed for %s codes: %s", len(batch), e)
+            continue
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        for seg, byid in (data or {}).items():
+            for sid, payload in (byid or {}).items():
+                price = payload.get("last_price") if isinstance(payload, dict) else payload
+                code = back.get((seg, str(sid)))
+                if code and price is not None:
+                    try:
+                        out[code] = float(price)
+                    except (TypeError, ValueError):
+                        pass
     return out
 
 

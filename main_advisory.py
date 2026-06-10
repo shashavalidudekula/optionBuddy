@@ -146,11 +146,11 @@ class OptionGenTrigger:
     """Adaptive time-based scanning for options — maximum responsiveness to reversals.
 
     Scanning intervals (time-of-day aware):
-      9:15–9:45 AM: 1-2 sec   (peak opening volatility, catch ALL reversals)
+      9:15–9:45 AM: 3 sec    (peak opening volatility, catch reversals)
       9:45–10:30 AM: 20 sec   (still volatile, need quick response)
       10:30 AM–12:00 PM: 45 sec  (mid-morning, lower volatility)
       12:00–1:00 PM: 30 sec   (lunch volatility spike)
-      1:00–3:30 PM: 10 sec    (afternoon session, moderate volatility)
+      1:00–3:30 PM: 15 sec    (afternoon session, moderate volatility)
 
     Reversal trigger: 0.25% (immediate rescan if market reverses)
 
@@ -180,9 +180,9 @@ class OptionGenTrigger:
         minute = now.minute
         time_mins = hour * 60 + minute
 
-        # 9:15–9:45 AM: 1-2 sec (peak opening volatility)
+        # 9:15–9:45 AM: 3 sec (peak opening volatility)
         if dtime(9, 15) <= now.time() <= dtime(9, 45):
-            return 1.5
+            return 3
         # 9:45–10:30 AM: 20 sec (still volatile)
         elif dtime(9, 45) < now.time() <= dtime(10, 30):
             return 20
@@ -192,9 +192,9 @@ class OptionGenTrigger:
         # 12:00–1:00 PM: 30 sec (lunch volatility)
         elif dtime(12, 0) < now.time() <= dtime(13, 0):
             return 30
-        # 1:00–3:30 PM: 10 sec (afternoon)
+        # 1:00–3:30 PM: 15 sec (afternoon)
         elif dtime(13, 0) < now.time() <= dtime(15, 30):
-            return 10
+            return 15
         # Default fallback (outside trading hours)
         else:
             return 60
