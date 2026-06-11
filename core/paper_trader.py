@@ -32,6 +32,7 @@ from config.settings import (
     MIN_CONFIDENCE,
     PAPER_CATEGORIES,
     PAPER_DAILY_LOSS_PCT,
+    PAPER_MAX_LOTS,
     PAPER_MAX_OPEN,
     PAPER_MIN_LOTS,
     PAPER_PARTIAL_FRACTION,
@@ -39,6 +40,7 @@ from config.settings import (
     PAPER_START_CAPITAL,
 )
 from core.market_data_provider import get_lot_size, option_expiry_for
+from core.call_tracker import t1_locked_stop
 from core.execution import PaperBroker
 from data.advisory_store import (
     book_paper_exit,
@@ -217,6 +219,10 @@ class PaperTrader:
         risk_budget = PAPER_RISK_PCT * equity
         risk_lots = math.floor(risk_budget / (per_unit_risk * lot_size))
         lots = max(PAPER_MIN_LOTS, risk_lots)  # every trade is at least PAPER_MIN_LOTS
+        # Ceiling: cheap near-expiry premiums make per-unit risk tiny, so risk
+        # sizing alone balloons into 20-300 lots of lottery tickets.
+        if PAPER_MAX_LOTS > 0:
+            lots = min(lots, PAPER_MAX_LOTS)
 
         # Capital halt: a long costs premium/price × qty up front. If free cash
         # can't fund the minimum trade size, halt execution and log it as unfunded.
@@ -275,8 +281,8 @@ class PaperTrader:
         return PAPER_PARTIAL_FRACTION
 
     def _book_partial(self, call: dict, exit_price: float | None) -> str | None:
-        """Book the T1 partial. The SL is already trailed to breakeven by the
-        tracker on the target1_hit event, so the profit is protected here either
+        """Book the T1 partial. The SL is already trailed to just below T1 by the
+        tracker on the target1_hit event, so the profit is locked here either
         way — this only handles selling the partial quantity."""
         pos = get_open_paper_position_by_call(call.get("id"))
         if not pos or exit_price is None:
@@ -284,6 +290,7 @@ class PaperTrader:
         lot_size = int(pos["lot_size"])
         action = str(pos["action"]).upper()
         entry = float(pos["entry_price"])
+        locked_sl = t1_locked_stop(action, entry, exit_price)
         exit_fraction = self._t1_exit_fraction(pos.get("category", ""))
         partial_lots = math.floor(int(pos["lots"]) * exit_fraction)
         exit_qty = partial_lots * lot_size
@@ -291,13 +298,13 @@ class PaperTrader:
 
         # A lot is indivisible: a single-lot position (or a fraction that rounds to
         # zero lots) can't be split. Hold the whole position for T2 — the SL is
-        # already at breakeven, so it exits flat at worst, never at a loss.
+        # already locked below T1, so it exits in profit, never at a loss.
         if exit_qty < lot_size or exit_qty >= remaining:
-            log.info("PAPER T1 %s: indivisible (%s lot) — holding for T2, SL at breakeven ₹%.2f",
-                     pos["instrument"], pos["lots"], entry)
+            log.info("PAPER T1 %s: indivisible (%s lot) — holding for T2, SL locked at ₹%.2f",
+                     pos["instrument"], pos["lots"], locked_sl)
             return (f"🎯 <b>PAPER T1 hit</b> <b>{pos['instrument']}</b> — holding "
                     f"{remaining} (can't split 1 lot) for T2\n"
-                    f"🛑 SL moved to breakeven (₹{entry:,.2f}) — profit protected")
+                    f"🛑 SL trailed to ₹{locked_sl:,.2f} (just below T1) — profit locked")
 
         realized, cash_delta = _pnl_cash(action, entry, exit_price, exit_qty)
         book_paper_exit(
@@ -305,8 +312,8 @@ class PaperTrader:
             exit_qty=exit_qty, exit_price=round(exit_price, 2),
             realized_delta=realized, cash_delta=cash_delta, kind="partial", fully_closed=False,
         )
-        log.info("PAPER PARTIAL %s ×%s (%.0f%%) @ %.2f (pnl %.0f) | SL at breakeven ₹%.2f",
-                 pos["instrument"], exit_qty, exit_fraction * 100, exit_price, realized, entry)
+        log.info("PAPER PARTIAL %s ×%s (%.0f%%) @ %.2f (pnl %.0f) | SL locked at ₹%.2f",
+                 pos["instrument"], exit_qty, exit_fraction * 100, exit_price, realized, locked_sl)
         try:  # real-order hook (no-op in paper; double-guarded in live)
             self.broker.place_exit(call, action, exit_qty, exit_price, "partial")
         except Exception as e:  # noqa: BLE001
@@ -315,7 +322,8 @@ class PaperTrader:
         emoji = "🟢" if realized >= 0 else "🔴"
         return (f"💰 <b>PAPER T1</b> booked {exit_qty} ({exit_fraction * 100:.0f}%) of "
                 f"<b>{pos['instrument']}</b> @ ₹{exit_price:,.2f} {emoji} ₹{realized:,.0f}\n"
-                f"🛑 SL at breakeven (₹{entry:,.2f}); holding {remaining - exit_qty} for T2")
+                f"🛑 SL trailed to ₹{locked_sl:,.2f} (just below T1); "
+                f"holding {remaining - exit_qty} for T2")
 
     def _close(self, call: dict, exit_price: float | None, kind: str) -> str | None:
         pos = get_open_paper_position_by_call(call.get("id"))

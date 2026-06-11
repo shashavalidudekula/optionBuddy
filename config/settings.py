@@ -101,6 +101,10 @@ PAPER_TRADING_ENABLED   = os.getenv("PAPER_TRADING_ENABLED", "true").lower() == 
 PAPER_START_CAPITAL     = float(os.getenv("PAPER_START_CAPITAL", "100000"))
 PAPER_RISK_PCT          = float(os.getenv("PAPER_RISK_PCT", "0.02"))   # risk 2% of equity to stop
 PAPER_MIN_LOTS          = int(os.getenv("PAPER_MIN_LOTS", "2"))         # floor: every trade is >= this many lots
+# Ceiling on lots per trade. Risk-sizing divides by the per-unit stop distance, so
+# a cheap near-expiry option (premium ₹1-25) explodes into 20-300 lots of lottery
+# tickets unless capped (0 = uncapped).
+PAPER_MAX_LOTS          = int(os.getenv("PAPER_MAX_LOTS", "10"))
 PAPER_MAX_OPEN          = int(os.getenv("PAPER_MAX_OPEN", "0"))         # max concurrent positions (0 = unlimited; capital is the only limit)
 PAPER_DAILY_LOSS_PCT    = float(os.getenv("PAPER_DAILY_LOSS_PCT", "0.04"))  # halt new entries for the day
 PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # book this much at T1 (60%); hold 40% for T2
@@ -145,6 +149,19 @@ TAPE_FILTER_ENABLED = os.getenv("TAPE_FILTER_ENABLED", "true").lower() == "true"
 TAPE_MIN_MOVE_PCT   = float(os.getenv("TAPE_MIN_MOVE_PCT", "0.25"))   # day move to call a trend (entry)
 TAPE_EXIT_ENABLED   = os.getenv("TAPE_EXIT_ENABLED", "true").lower() == "true"
 TAPE_EXIT_MOVE_PCT  = float(os.getenv("TAPE_EXIT_MOVE_PCT", "0.40"))  # stronger move to cut a held loser
+# Reversal off the day's extremes. The from-open rules above are blind to an
+# afternoon slide that starts from a big morning gain (+1.2% → +0.5% still reads
+# "up" all the way down). A pullback of this size from the day high/low, with
+# momentum agreeing, overrides the from-open read.
+TAPE_REVERSAL_PCT      = float(os.getenv("TAPE_REVERSAL_PCT", "0.35"))   # pullback to call a reversal (entry gate)
+TAPE_EXIT_REVERSAL_PCT = float(os.getenv("TAPE_EXIT_REVERSAL_PCT", "0.50"))  # stronger pullback to cut a held position
+
+# -- Post-T1 stop trail ---------------------------------------------------------
+# Once T1 is hit, the stop trails to lock this fraction of the entry→T1 move
+# (0 = old breakeven behaviour, 1 = stop exactly at T1). 0.75 → SL sits 25% of
+# the move below T1, so the runner keeps most of the T1 profit instead of riding
+# all the way back to flat.
+T1_TRAIL_LOCK_FRACTION = float(os.getenv("T1_TRAIL_LOCK_FRACTION", "0.75"))
 
 # -- Instruments (INDstocks security_ids) ------------------------------------
 TRACKED_INDICES    = os.getenv("TRACKED_INDICES", "13,25,1").split(",")      # Nifty50, BankNifty, VIX

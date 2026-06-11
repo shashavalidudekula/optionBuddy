@@ -215,13 +215,31 @@ def _compute_intraday(symbol: str, ticker: str) -> dict | None:
     else:
         or_state = "inside_OR"
 
-    # 30-min momentum (6 bars back).
+    # 30-min momentum (6 bars back) + 15-min (3 bars) for faster reversal reads.
     back = closes[-7] if len(closes) >= 7 else closes[0]
     mom_pct = round((last - back) / back * 100, 2) if back else 0.0
+    back15 = closes[-4] if len(closes) >= 4 else closes[0]
+    mom15_pct = round((last - back15) / back15 * 100, 2) if back15 else 0.0
+
+    # Where price sits vs today's extremes. A from-open change can stay positive
+    # through an entire afternoon slide; these expose the slide directly.
+    day_high = max(highs)
+    day_low = min(lows)
+    pct_from_day_high = round((last - day_high) / day_high * 100, 2) if day_high else 0.0  # <= 0
+    pct_from_day_low = round((last - day_low) / day_low * 100, 2) if day_low else 0.0      # >= 0
+    # Which extreme printed last. A move away from the day high only counts as a
+    # reversal while the high is the most recent extreme (and vice versa) —
+    # otherwise any green day reads as "reversed up off the low" all day long.
+    hi_idx = max(range(len(highs)), key=lambda i: highs[i])
+    lo_idx = min(range(len(lows)), key=lambda i: lows[i])
+    last_extreme = "high" if hi_idx >= lo_idx else "low"
 
     return {
         "last": last,
         "intraday_change_pct": intraday_change_pct,
+        "pct_from_day_high": pct_from_day_high,
+        "pct_from_day_low": pct_from_day_low,
+        "last_extreme": last_extreme,
         "rsi14_5m": rsi14,
         "ema9_5m": round(ema9, 2) if ema9 is not None else None,
         "ema21_5m": round(ema21, 2) if ema21 is not None else None,
@@ -231,6 +249,7 @@ def _compute_intraday(symbol: str, ticker: str) -> dict | None:
         "opening_range_low": or_low,
         "opening_range_state": or_state,
         "momentum_30m_pct": mom_pct,
+        "momentum_15m_pct": mom15_pct,
         "trend_5m": _trend_intraday(last, ema9, ema21),
         "bars": len(closes),
     }
@@ -267,9 +286,10 @@ def get_intraday_technicals(symbols: list[str] | None = None) -> dict[str, dict]
     """Return INTRADAY (5-min) technical context per underlying (cached ~60s).
 
     Returns:
-        {symbol: {last, intraday_change_pct, rsi14_5m, ema9_5m, ema21_5m, vwap,
-                  vwap_state, opening_range_high/low/state, momentum_30m_pct,
-                  trend_5m, bars}} — symbols that fail are omitted.
+        {symbol: {last, intraday_change_pct, pct_from_day_high, pct_from_day_low,
+                  rsi14_5m, ema9_5m, ema21_5m, vwap, vwap_state,
+                  opening_range_high/low/state, momentum_30m_pct,
+                  momentum_15m_pct, trend_5m, bars}} — symbols that fail are omitted.
     """
     syms = symbols or ["NIFTY", "BANKNIFTY"]
     out: dict[str, dict] = {}

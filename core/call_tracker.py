@@ -18,12 +18,26 @@ from datetime import datetime
 from typing import Callable
 
 from config.logger import get_logger
+from config.settings import T1_TRAIL_LOCK_FRACTION
 from data.advisory_store import get_active_calls, update_call_status
 from core.tape_filter import is_invalidated
 
 log = get_logger("call_tracker")
 
 PriceLookup = Callable[[dict], float | None]
+
+
+def t1_locked_stop(action: str, entry: float, t1: float) -> float:
+    """Trailed stop after T1: lock T1_TRAIL_LOCK_FRACTION of the entry→T1 move.
+
+    At 0.75 a BUY stop sits 25% of the move below T1 — most of the T1 profit is
+    kept, with enough room that noise around T1 doesn't shake out the runner.
+    0 degrades to breakeven (the old behaviour); 1 is a stop exactly at T1.
+    """
+    frac = min(max(T1_TRAIL_LOCK_FRACTION, 0.0), 1.0)
+    if action == "BUY":
+        return round(entry + (t1 - entry) * frac, 2)
+    return round(entry - (entry - t1) * frac, 2)
 
 
 def _pct(action: str, entry: float, exit_price: float) -> float:
@@ -108,12 +122,13 @@ def _evaluate_call(call: dict, price: float) -> dict | None:
                 update_call_status(call["id"], "target_hit", last_price=price,
                                    result_pct=_pct(action, entry, t1))
                 return event("target_hit", exit_price=t1)
-            # Trail the stop-loss to breakeven (entry) the moment T1 is hit, so the
-            # remaining position can only exit at profit (T2) or flat (breakeven) —
-            # never back at the original loss. Persisting it here means it works for
-            # every call, including single-lot paper positions that can't be split.
+            # Trail the stop-loss to just below T1 the moment T1 is hit, locking
+            # most of the T1 profit — breakeven alone let the runner ride a reversal
+            # all the way back to flat. Persisting it here means it works for every
+            # call, including single-lot paper positions that can't be split.
             update_call_status(call["id"], "target1_hit", last_price=price,
-                               result_pct=_pct(action, entry, t1), stop_loss=entry)
+                               result_pct=_pct(action, entry, t1),
+                               stop_loss=t1_locked_stop(action, entry, t1))
             return event("target1_hit", exit_price=t1)
 
     # 4) Entry trigger (informational)

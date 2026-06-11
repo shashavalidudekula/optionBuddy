@@ -77,6 +77,13 @@ _CATEGORY_GUIDANCE = {
         "it is trending DOWN. Do not fade an active intraday trend unless you cite a SPECIFIC, "
         "named reversal signal (e.g. rejection at a stated resistance with momentum divergence) in "
         "the rationale. When the tape is genuinely flat/choppy, it is fine to return no option calls.\n"
+        "REVERSAL RULE (critical — the day change can stay positive while the market is falling): "
+        "judge the trend from the day's EXTREMES, not the open. If 'pct_from_day_high' shows the "
+        "index has pulled back more than ~0.3% from its day high and 'momentum_30m_pct'/"
+        "'momentum_15m_pct' are flat or negative, the uptrend is BROKEN no matter how green the "
+        "day still looks — do NOT buy fresh CALLs (CE) into it. Either stand aside or, on a "
+        "confirmed breakdown (lower lows, below VWAP, 'trend_5m' down), switch to PUTs (PE). "
+        "Mirror this off the day low for bounces.\n"
         "IMPORTANT: When an 'option_chain' is provided in the market snapshot, you MUST pick a "
         "strike that exists in it and set 'entry_price' at (or very close to) that strike's live "
         "'premium'. Derive 'target_1'/'target_2'/'stop_loss' from that live premium so the call "
@@ -134,8 +141,10 @@ def _system_prompt(category: str) -> str:
         "7. GROUND every view in the data provided. The 'technicals' block is DAILY structure "
         "(RSI, EMA20/EMA50, 'trend', ATR14 for ~1-2x ATR stops, 20-day range). The 'intraday' "
         "block is the LIVE 5-minute read for TIMING: rsi14_5m, ema9_5m/ema21_5m and 'trend_5m', "
-        "'vwap_state' (above/below VWAP), 'opening_range_state' and 'momentum_30m_pct'. Align the "
-        "trade with intraday momentum and only fade it with a clear reason. Do NOT invent indicator "
+        "'vwap_state' (above/below VWAP), 'opening_range_state', 'momentum_30m_pct'/"
+        "'momentum_15m_pct', and 'pct_from_day_high'/'pct_from_day_low' (position vs today's "
+        "extremes — the reversal tell). Align the trade with intraday momentum and only fade it "
+        "with a clear reason. Do NOT invent indicator "
         'values or cite TA you were not given. If nothing is high-conviction, use {"calls": []}.\n'
     )
 

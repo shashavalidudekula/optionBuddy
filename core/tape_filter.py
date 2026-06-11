@@ -24,6 +24,8 @@ from config.settings import (
     TAPE_MIN_MOVE_PCT,
     TAPE_EXIT_ENABLED,
     TAPE_EXIT_MOVE_PCT,
+    TAPE_REVERSAL_PCT,
+    TAPE_EXIT_REVERSAL_PCT,
 )
 from core.technicals import get_intraday_technicals
 
@@ -53,12 +55,24 @@ def _call_view(call: dict) -> str | None:
     return "up" if action == "BUY" else "down"
 
 
-def tape_direction(underlying: str, min_move: float = TAPE_MIN_MOVE_PCT) -> tuple[str, str]:
+def tape_direction(
+    underlying: str,
+    min_move: float = TAPE_MIN_MOVE_PCT,
+    reversal_move: float = TAPE_REVERSAL_PCT,
+) -> tuple[str, str]:
     """Realized intraday direction: ('up'|'down'|'flat', human reason).
 
-    Requires a real day move (>= min_move), 30-min momentum agreement, and the
-    5-min EMA trend + opening-range not contradicting. Anything short of that is
-    'flat' (we never act on chop).
+    Two reads, reversal first:
+      1. Reversal off the day's extremes — price pulled back >= reversal_move
+         from the day high (or bounced off the low) with momentum agreeing.
+         This catches the afternoon slide that starts from a big morning gain:
+         the from-open change stays positive all the way down, so rule 2 alone
+         reads it as "up" while the index is falling (the failure mode that kept
+         buying CALLs into a 1 PM sell-off).
+      2. From-open trend — a real day move (>= min_move) with 30-min momentum,
+         5-min EMA trend and opening-range agreement, but only while price is
+         still near the extreme in that direction (not after a reversal-sized
+         pullback). Anything short of that is 'flat' (we never act on chop).
     """
     u = underlying.upper()
     tech = get_intraday_technicals([u]).get(u)
@@ -66,16 +80,37 @@ def tape_direction(underlying: str, min_move: float = TAPE_MIN_MOVE_PCT) -> tupl
         return "flat", "no-data"
     chg = tech.get("intraday_change_pct")
     mom = tech.get("momentum_30m_pct") or 0.0
+    mom15 = tech.get("momentum_15m_pct") or 0.0
     trend = tech.get("trend_5m")
     ors = tech.get("opening_range_state")
+    off_high = tech.get("pct_from_day_high") or 0.0   # <= 0
+    off_low = tech.get("pct_from_day_low") or 0.0     # >= 0
+    last_extreme = tech.get("last_extreme")           # which extreme printed last
     if chg is None:
         return "flat", "no-change-data"
 
-    if chg >= min_move and mom >= 0 and trend != "down" and ors != "below_OR_low":
+    # 1) Reversal off the day's extremes (overrides the from-open read). Only the
+    #    most recently printed extreme counts — on a green day price sits far above
+    #    the morning low ALL day, which isn't an "up reversal"; it only becomes one
+    #    if a fresh low printed and price is bouncing off it (and vice versa).
+    if (off_high <= -reversal_move and min(mom, mom15) <= 0 and trend != "up"
+            and last_extreme != "low"):
+        return "down", (f"reversal {off_high:+.2f}% off day high, day {chg:+.2f}%, "
+                        f"30m {mom:+.2f}%, 15m {mom15:+.2f}%, 5m {trend}")
+    if (off_low >= reversal_move and max(mom, mom15) >= 0 and trend != "down"
+            and last_extreme != "high"):
+        return "up", (f"reversal {off_low:+.2f}% off day low, day {chg:+.2f}%, "
+                      f"30m {mom:+.2f}%, 15m {mom15:+.2f}%, 5m {trend}")
+
+    # 2) From-open trend — only while price is still near the day's extreme in
+    #    that direction; a reversal-sized pullback demotes it to 'flat'.
+    if (chg >= min_move and mom >= 0 and trend != "down" and ors != "below_OR_low"
+            and off_high > -reversal_move):
         return "up", f"day {chg:+.2f}%, 30m {mom:+.2f}%, 5m {trend}"
-    if chg <= -min_move and mom <= 0 and trend != "up" and ors != "above_OR_high":
+    if (chg <= -min_move and mom <= 0 and trend != "up" and ors != "above_OR_high"
+            and off_low < reversal_move):
         return "down", f"day {chg:+.2f}%, 30m {mom:+.2f}%, 5m {trend}"
-    return "flat", f"day {chg:+.2f}% (no clear trend)"
+    return "flat", f"day {chg:+.2f}%, {off_high:+.2f}% off high (no clear trend)"
 
 
 # ── Layer 2: entry gate ──────────────────────────────────────────────────────
@@ -129,7 +164,8 @@ def is_invalidated(call: dict) -> tuple[bool, str]:
     u = str(call.get("underlying", "")).upper()
     if u not in _GATEABLE:
         return False, "ungated-underlying"
-    direction, why = tape_direction(u, min_move=TAPE_EXIT_MOVE_PCT)
+    direction, why = tape_direction(u, min_move=TAPE_EXIT_MOVE_PCT,
+                                    reversal_move=TAPE_EXIT_REVERSAL_PCT)
     if direction != "flat" and direction != view:
         return True, f"tape reversed to {direction} vs {view} call ({why})"
     return False, f"tape-ok ({direction})"
