@@ -80,6 +80,7 @@ EVENT_LABEL = {
     "sl_hit": "🛑 Stop-loss hit — call closed",
     "expired": "⌛ Call expired",
     "invalidated": "🔄 Trend reversed — call cut early",
+    "cancelled": "🚫 Entry scrapped — tape turned before the fill",
 }
 
 

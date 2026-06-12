@@ -14,17 +14,34 @@ The tracker is decoupled from the price source: the caller passes a
 call is left untouched (only expiry can still close it).
 """
 
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Callable
 
 from config.logger import get_logger
 from config.settings import T1_TRAIL_LOCK_FRACTION
 from data.advisory_store import get_active_calls, update_call_status
-from core.tape_filter import is_invalidated
+from core.tape_filter import is_invalidated, confirm_call
 
 log = get_logger("call_tracker")
 
 PriceLookup = Callable[[dict], float | None]
+
+_MARKET_CLOSE = dtime(15, 30)
+
+
+def _contract_expired(call: dict, now: datetime) -> bool:
+    """True when the option CONTRACT itself is dead (cash-settled 15:30 on expiry day).
+
+    `expires_at` only covers the call's validity window — a swing-timeframe call
+    on a weekly contract outlives the contract, leaving it 'waiting for trigger'
+    on the dashboard days after the exchange has already settled it.
+    """
+    exp = call.get("option_expiry")
+    if exp is None:
+        return False
+    if isinstance(exp, datetime):
+        exp = exp.date()
+    return exp < now.date() or (exp == now.date() and now.time() >= _MARKET_CLOSE)
 
 
 def t1_locked_stop(action: str, entry: float, t1: float) -> float:
@@ -131,8 +148,17 @@ def _evaluate_call(call: dict, price: float) -> dict | None:
                                stop_loss=t1_locked_stop(action, entry, t1))
             return event("target1_hit", exit_price=t1)
 
-    # 4) Entry trigger (informational)
+    # 4) Entry trigger — re-confirm against the tape AT THE MOMENT the premium
+    #    reaches the entry zone, not just at issue time. A BUY CE issued in an
+    #    uptrend often only "comes back down" to its entry price because the
+    #    trend reversed — filling it then buys a call into a falling market.
     if not triggered and _in_entry_zone(action, price, call):
+        allow, why = confirm_call(call)
+        if not allow:
+            update_call_status(call["id"], "closed", last_price=price)
+            log.info("Call #%s CANCELLED at entry @ %.2f (%s) — stale setup: %s",
+                     call["id"], price, call["instrument"], why)
+            return event("cancelled")
         update_call_status(call["id"], status, last_price=price, entry_triggered=True)
         return event("entry_triggered")
 
@@ -154,12 +180,16 @@ def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
     now = datetime.now()
 
     for call in get_active_calls():
-        # Expiry check first
+        # Expiry check first: the call's validity window OR the option contract
+        # itself lapsing — whichever comes first kills the call.
         expires_at = call.get("expires_at")
-        if expires_at and isinstance(expires_at, datetime) and now >= expires_at:
+        validity_over = bool(expires_at and isinstance(expires_at, datetime) and now >= expires_at)
+        if validity_over or _contract_expired(call, now):
             last = call.get("last_price")
             result = None
-            if last is not None and call.get("entry_price"):
+            # Only a triggered call has an outcome to score — an untriggered one
+            # simply lapsed and shouldn't be booked with a phantom result.
+            if call.get("entry_triggered") and last is not None and call.get("entry_price"):
                 result = _pct(str(call["action"]).upper(),
                               float(call["entry_price"]), float(last))
             update_call_status(call["id"], "expired", result_pct=result)
