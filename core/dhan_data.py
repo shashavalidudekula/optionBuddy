@@ -444,7 +444,8 @@ def _future_scrip(underlying: str) -> str | None:
     return _scrip_code(rows[0])
 
 
-def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | None = None) -> str | None:
+def _option_scrip(underlying: str, strike: float, opt_type: str,
+                  expiry: date | None = None) -> str | None:
     _load_master()
     u = underlying.upper().strip()
     ot = opt_type.upper().strip()
@@ -452,15 +453,36 @@ def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | N
             if _row_underlying(r) == u and (r.get("SEM_OPTION_TYPE", "").upper() == ot)]
     if not rows:
         return None
-    exp = expiry or _nearest_expiry_row(rows, date.today())
 
     def _match(r):
         return abs(_strike_of(r) - strike) < 0.5
 
+    # Price the EXACT contract when the caller knows its expiry. Defaulting to
+    # today's nearest expiry silently re-points a previous-day call to the next
+    # weekly the morning after an expiry day — its T2/SL then track the wrong
+    # premium and the call never closes.
+    if expiry is not None:
+        cand = [r for r in rows
+                if _match(r) and _parse_expiry(r.get("SEM_EXPIRY_DATE", "")) == expiry]
+        if cand:
+            return _scrip_code(cand[0])
+
+    exp = _nearest_expiry_row(rows, date.today())
     cand = [r for r in rows if r.get("SEM_EXPIRY_DATE") == exp and _match(r)]
     if not cand:
         cand = [r for r in rows if _match(r)]
     return _scrip_code(cand[0]) if cand else None
+
+
+def _coerce_expiry(v) -> date | None:
+    """option_expiry as stored on a call (DATE, datetime, or ISO string) → date."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        return _parse_expiry(v)
+    return None
 
 
 def resolve_scrip_for_call(call: dict) -> str | None:
@@ -475,7 +497,8 @@ def resolve_scrip_for_call(call: dict) -> str | None:
         m = _OPTION_RE.search(instrument)
         if not m:
             return None
-        return _option_scrip(underlying, float(m.group(1)), m.group(2))
+        return _option_scrip(underlying, float(m.group(1)), m.group(2),
+                             expiry=_coerce_expiry(call.get("option_expiry")))
     if cat == "futures":
         return _future_scrip(underlying) or _index_scrip(underlying) or _equity_scrip(underlying)
     if cat == "equity":

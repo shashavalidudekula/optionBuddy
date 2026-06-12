@@ -198,7 +198,8 @@ def _future_scrip(underlying: str) -> str | None:
     return _scrip_code(rows[0])
 
 
-def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | None = None) -> str | None:
+def _option_scrip(underlying: str, strike: float, opt_type: str,
+                  expiry: date | None = None) -> str | None:
     u = underlying.upper().strip()
     ot = opt_type.upper().strip()
     rows = [
@@ -208,7 +209,6 @@ def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | N
     ]
     if not rows:
         return None
-    exp = expiry or _nearest_expiry(rows, date.today())
 
     def _strike_match(r):
         try:
@@ -216,10 +216,31 @@ def _option_scrip(underlying: str, strike: float, opt_type: str, expiry: str | N
         except (TypeError, ValueError):
             return False
 
+    # Price the EXACT contract when the caller knows its expiry — defaulting to
+    # today's nearest expiry re-points a previous-day call to the next weekly
+    # the morning after an expiry day.
+    if expiry is not None:
+        candidates = [r for r in rows
+                      if _strike_match(r) and _parse_expiry(r.get("EXPIRY_DATE", "")) == expiry]
+        if candidates:
+            return _scrip_code(candidates[0])
+
+    exp = _nearest_expiry(rows, date.today())
     candidates = [r for r in rows if r.get("EXPIRY_DATE") == exp and _strike_match(r)]
     if not candidates:
         candidates = [r for r in rows if _strike_match(r)]
     return _scrip_code(candidates[0]) if candidates else None
+
+
+def _coerce_expiry(v) -> date | None:
+    """option_expiry as stored on a call (DATE, datetime, or ISO string) → date."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        return _parse_expiry(v)
+    return None
 
 
 # Strike + option type, tolerant of separators so both "NIFTY 23400 PE" and the
@@ -241,7 +262,8 @@ def resolve_scrip_for_call(call: dict) -> str | None:
         if not m:
             return None
         strike = float(m.group(1))
-        return _option_scrip(underlying, strike, m.group(2))
+        return _option_scrip(underlying, strike, m.group(2),
+                             expiry=_coerce_expiry(call.get("option_expiry")))
 
     if cat == "futures":
         return _future_scrip(underlying) or _index_scrip(underlying) or _equity_scrip(underlying)

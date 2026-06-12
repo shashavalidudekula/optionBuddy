@@ -404,7 +404,7 @@ class PaperTrader:
             if exp is None or exp > today:
                 continue
             mini = {"category": pos.get("category"), "underlying": pos.get("underlying"),
-                    "instrument": pos.get("instrument")}
+                    "instrument": pos.get("instrument"), "option_expiry": exp}
             price = None
             try:
                 price = price_lookup(mini)
@@ -422,11 +422,18 @@ class PaperTrader:
 
     def mark_to_market(self, price_lookup) -> None:
         """Refresh open-position prices and record equity / drawdown."""
-        for pos in get_open_paper_positions():
+        from data.advisory_store import get_call_levels
+
+        open_pos = get_open_paper_positions()
+        levels = get_call_levels([p.get("call_id") for p in open_pos]) if open_pos else {}
+        for pos in open_pos:
             mini_call = {
                 "category": pos.get("category"),
                 "underlying": pos.get("underlying"),
                 "instrument": pos.get("instrument"),
+                # Pin the quote to the position's actual contract — without this
+                # the lookup falls back to today's nearest expiry.
+                "option_expiry": (levels.get(pos.get("call_id")) or {}).get("option_expiry"),
             }
             try:
                 price = price_lookup(mini_call)
