@@ -41,7 +41,7 @@ from data.advisory_store import (
     get_active_calls,
 )
 from signals.advisory_engine import generate_calls
-from core.call_tracker import track_active_calls
+from core.call_tracker import track_active_calls, sweep_stale_calls
 from core.paper_trader import PaperTrader
 from core.execution import get_broker
 from core.market_data_provider import (
@@ -375,6 +375,19 @@ async def run() -> None:
     log.info("Advisory orchestrator started (poll=%ss, premarket=9:08, options=event-driven, others=%smin)",
              POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN)
 
+    # Clean the board before doing anything else: contracts that expired while we
+    # were down, lapsed validity windows, and entries still waiting from a previous
+    # day. The tracking pass also sweeps, but only during market hours — without
+    # this, a night/pre-market restart leaves dead calls on the dashboard till 9:15.
+    try:
+        swept = await asyncio.to_thread(sweep_stale_calls)
+        for evt in swept:
+            await bot.push_call_event(evt)
+        if swept:
+            log.info("Startup sweep closed %s stale call(s)", len(swept))
+    except Exception as e:
+        log.error("Startup call sweep failed: %s", e)
+
     try:
         while True:
             now = datetime.now()
@@ -451,6 +464,16 @@ async def run() -> None:
                             log.info("Expiry settlement closed %s position(s)", len(notes))
                     except Exception as e:
                         log.error("Expiry settlement failed: %s", e)
+                # EOD rule: no call carries overnight waiting for its trigger —
+                # cancel every unfilled entry; tomorrow's market gets fresh calls.
+                try:
+                    swept = await asyncio.to_thread(sweep_stale_calls)
+                    for evt in swept:
+                        await bot.push_call_event(evt)
+                    if swept:
+                        log.info("EOD sweep closed %s stale call(s)", len(swept))
+                except Exception as e:
+                    log.error("EOD call sweep failed: %s", e)
                 try:
                     await send_eod_summary(bot)
                 except Exception as e:

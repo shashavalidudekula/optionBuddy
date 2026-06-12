@@ -81,6 +81,7 @@ EVENT_LABEL = {
     "expired": "⌛ Call expired",
     "invalidated": "🔄 Trend reversed — call cut early",
     "cancelled": "🚫 Entry scrapped — tape turned before the fill",
+    "unfilled": "🌙 Entry never filled — cancelled at end of day",
 }
 
 

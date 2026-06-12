@@ -167,6 +167,70 @@ def _evaluate_call(call: dict, price: float) -> dict | None:
     return None
 
 
+def _make_event(call: dict, event_type: str, price, result) -> dict:
+    return {
+        "call_id": call["id"],
+        "instrument": call["instrument"],
+        "category": call["category"],
+        "event_type": event_type,
+        "price": price,
+        "result_pct": result,
+        "call": call,
+    }
+
+
+def _expiry_event(call: dict, now: datetime) -> dict | None:
+    """Expire a call whose validity window OR option contract has lapsed.
+
+    Returns the 'expired' event (after persisting the status) or None.
+    """
+    expires_at = call.get("expires_at")
+    validity_over = bool(expires_at and isinstance(expires_at, datetime) and now >= expires_at)
+    if not (validity_over or _contract_expired(call, now)):
+        return None
+    last = call.get("last_price")
+    result = None
+    # Only a triggered call has an outcome to score — an untriggered one
+    # simply lapsed and shouldn't be booked with a phantom result.
+    if call.get("entry_triggered") and last is not None and call.get("entry_price"):
+        result = _pct(str(call["action"]).upper(),
+                      float(call["entry_price"]), float(last))
+    update_call_status(call["id"], "expired", result_pct=result)
+    return _make_event(call, "expired", last, result)
+
+
+def sweep_stale_calls(now: datetime | None = None) -> list[dict]:
+    """Price-free cleanup pass — safe to run any time, including off-hours.
+
+    Two rules:
+      1. Expire calls whose validity window or option contract has lapsed
+         (the tracker does this too, but it only runs during market hours —
+         a restart at night/pre-market would otherwise leave dead-contract
+         calls on the dashboard until 9:15).
+      2. EOD rule: an entry that hasn't filled by the close is a stale setup —
+         tomorrow is a different market. Cancel every untriggered call after
+         15:30 (or from a previous day) instead of letting it wait overnight.
+    """
+    now = now or datetime.now()
+    events: list[dict] = []
+    for call in get_active_calls():
+        evt = _expiry_event(call, now)
+        if evt is not None:
+            log.info("Call #%s swept: expired (%s)", call["id"], call["instrument"])
+            events.append(evt)
+            continue
+        if call.get("entry_triggered"):
+            continue
+        issued = call.get("issued_at")
+        from_earlier_day = isinstance(issued, datetime) and issued.date() < now.date()
+        if from_earlier_day or now.time() >= _MARKET_CLOSE:
+            update_call_status(call["id"], "closed")
+            log.info("Call #%s swept: never filled — cancelled at EOD (%s)",
+                     call["id"], call["instrument"])
+            events.append(_make_event(call, "unfilled", call.get("last_price"), None))
+    return events
+
+
 def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
     """Run one tracking pass over all active calls.
 
@@ -182,26 +246,9 @@ def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
     for call in get_active_calls():
         # Expiry check first: the call's validity window OR the option contract
         # itself lapsing — whichever comes first kills the call.
-        expires_at = call.get("expires_at")
-        validity_over = bool(expires_at and isinstance(expires_at, datetime) and now >= expires_at)
-        if validity_over or _contract_expired(call, now):
-            last = call.get("last_price")
-            result = None
-            # Only a triggered call has an outcome to score — an untriggered one
-            # simply lapsed and shouldn't be booked with a phantom result.
-            if call.get("entry_triggered") and last is not None and call.get("entry_price"):
-                result = _pct(str(call["action"]).upper(),
-                              float(call["entry_price"]), float(last))
-            update_call_status(call["id"], "expired", result_pct=result)
-            events.append({
-                "call_id": call["id"],
-                "instrument": call["instrument"],
-                "category": call["category"],
-                "event_type": "expired",
-                "price": last,
-                "result_pct": result,
-                "call": call,
-            })
+        evt = _expiry_event(call, now)
+        if evt is not None:
+            events.append(evt)
             continue
 
         try:
