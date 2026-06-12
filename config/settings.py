@@ -172,3 +172,4 @@ TRACKED_COMMODITIES= [c.strip() for c in os.getenv("TRACKED_COMMODITIES", "").sp
 BASE_DIR           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH            = os.path.join(BASE_DIR, "data", "trading.db")
 LOG_DIR            = os.path.join(BASE_DIR, "logs")
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "30"))  # dated daily logs to keep (0 = forever)
