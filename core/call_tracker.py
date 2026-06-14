@@ -231,6 +231,45 @@ def sweep_stale_calls(now: datetime | None = None) -> list[dict]:
     return events
 
 
+def force_close_all_calls(price_lookup: PriceLookup | None = None,
+                          now: datetime | None = None) -> list[dict]:
+    """EOD square-off: close EVERY active call so nothing carries overnight.
+
+    Triggered (in-trade) calls are booked at the current premium (last_price as a
+    fallback) with a scored result; untriggered entries are simply cancelled.
+    Gated by EOD_SQUARE_OFF_ALL in main — when off, sweep_stale_calls runs instead.
+    """
+    now = now or datetime.now()
+    events: list[dict] = []
+    for call in get_active_calls():
+        if call.get("entry_triggered"):
+            price = None
+            if price_lookup is not None:
+                try:
+                    price = price_lookup(call)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("EOD price lookup failed for call #%s (%s): %s",
+                                call["id"], call["instrument"], e)
+            if price is None:
+                price = _f(call.get("last_price"))
+            entry = _f(call.get("entry_price"))
+            result = (_pct(str(call["action"]).upper(), entry, float(price))
+                      if price is not None and entry is not None else None)
+            update_call_status(call["id"], "expired",
+                               last_price=float(price) if price is not None else None,
+                               result_pct=result)
+            log.info("Call #%s EOD square-off @ %s (%s)",
+                     call["id"], f"{price:.2f}" if price is not None else "—", call["instrument"])
+            events.append(_make_event(call, "eod_squared_off",
+                                      float(price) if price is not None else None, result))
+        else:
+            update_call_status(call["id"], "closed")
+            log.info("Call #%s EOD square-off: never filled — cancelled (%s)",
+                     call["id"], call["instrument"])
+            events.append(_make_event(call, "unfilled", _f(call.get("last_price")), None))
+    return events
+
+
 def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
     """Run one tracking pass over all active calls.
 

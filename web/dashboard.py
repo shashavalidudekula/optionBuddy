@@ -30,6 +30,7 @@ from data.advisory_store import (
     get_not_executed_calls,
     get_call_levels,
 )
+from data.paper_history import daily_pnl, weekly_pnl
 
 log = get_logger("dashboard")
 
@@ -94,6 +95,8 @@ def _state() -> dict:
             "stats": {k: _clean(v) for k, v in stats.items()},
             "open": open_out,
             "closed": [_row(p) for p in get_closed_paper_positions(80)],
+            "daily": [_row(d) for d in daily_pnl(30)],
+            "weekly": [_row(d) for d in weekly_pnl(12)],
         },
         "calls": {
             "active": [_row(c) for c in get_active_calls()],
@@ -196,6 +199,10 @@ _PAGE = """<!doctype html>
 </header>
 <main>
   <div class="cards" id="cards"></div>
+  <div class="row">
+    <div id="weekly"></div>
+    <div id="daily"></div>
+  </div>
   <div id="open"></div>
   <div class="row">
     <div id="col-opt"></div>
@@ -287,6 +294,38 @@ function render(s){
   ];
   document.getElementById('cards').innerHTML = cards.map(c=>
     `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[3]||''}">${c[1]}</div>${c[2]?`<div class="sub">${c[2]}</div>`:''}</div>`).join('');
+
+  // P&L breakdown rows — shared between the weekly and daily tables.
+  const dayfmt = v => { if(!v) return "—"; const d=new Date(v+"T00:00:00");
+    return d.toLocaleDateString("en-IN",{weekday:"short",day:"2-digit",month:"short"}); };
+  const weekfmt = v => { if(!v) return "—"; const a=new Date(v+"T00:00:00");
+    const b=new Date(a); b.setDate(b.getDate()+4);  // Mon → Fri
+    const o={day:"2-digit",month:"short"};
+    return a.toLocaleDateString("en-IN",o)+" – "+b.toLocaleDateString("en-IN",o); };
+  const PNL_HEAD = lbl => [{t:lbl,l:1},{t:"Trades"},{t:"Wins"},{t:"Losses"},{t:"Win %"},{t:"Profit"},{t:"Loss"},{t:"Net P&L"}];
+  const pnlRow = (label, d) => `<tr>
+      <td class="l">${label}</td>
+      <td>${f0(d.trades)}</td>
+      <td class="pos">${f0(d.wins)}</td>
+      <td class="neg">${f0(d.losses)}</td>
+      <td class="${d.win_rate>=50?'pos':'neg'}">${f(d.win_rate,1)}%</td>
+      <td class="pos">${d.gross_profit>0?"+"+r0(d.gross_profit):"—"}</td>
+      <td class="neg">${d.gross_loss<0?r0(d.gross_loss):"—"}</td>
+      <td class="${sgn(d.net_pnl)}">${d.net_pnl>=0?"+":""}${r0(d.net_pnl)}</td></tr>`;
+
+  // Weekly P&L — resets each Monday with fresh capital; history kept for tracking.
+  const wk = s.paper.weekly || [];
+  const weeklyTbl = wk.length
+    ? tbl(PNL_HEAD("Week"), wk.map(d=>pnlRow(weekfmt(d.period), d)))
+    : '<div class="empty">No closed trades yet.</div>';
+  document.getElementById('weekly').innerHTML = capBox('Weekly P&L', 'by week · Mon–Fri', wk.length, weeklyTbl, 'short');
+
+  // Daily P&L
+  const dd = s.paper.daily || [];
+  const dailyTbl = dd.length
+    ? tbl(PNL_HEAD("Date"), dd.map(d=>pnlRow(dayfmt(d.period), d)))
+    : '<div class="empty">No closed trades yet.</div>';
+  document.getElementById('daily').innerHTML = capBox('Daily P&L', 'by day', dd.length, dailyTbl, 'short');
 
   // Open positions
   const op = s.paper.open;

@@ -116,6 +116,11 @@ PAPER_CATEGORIES        = tuple(
 # One-time destructive reset of the paper account on startup (wipes positions/
 # fills, restores PAPER_START_CAPITAL). Set true for one boot, then back to false.
 PAPER_RESET_ON_START    = os.getenv("PAPER_RESET_ON_START", "false").lower() == "true"
+# Weekly fresh start: on the first run of each new ISO week (Monday), wipe the
+# paper account back to PAPER_START_CAPITAL. Closed-trade history in
+# logs/paper_history.jsonl is untouched, so the dashboard's weekly/daily P&L
+# tables keep the full record. Set false to let capital compound across weeks.
+PAPER_WEEKLY_RESET      = os.getenv("PAPER_WEEKLY_RESET", "true").lower() == "true"
 # Fallback lot sizes when the instruments master is unavailable (SEBI revises these
 # periodically; the master is preferred when a session is present).
 PAPER_LOT_SIZES = {
@@ -127,6 +132,15 @@ PAPER_LOT_SIZES = {
 POLL_INTERVAL_SEC  = int(os.getenv("POLL_INTERVAL_SEC", "5"))   # fast loop: tracking + trigger checks
 MARKET_OPEN        = os.getenv("MARKET_OPEN", "09:15")
 MARKET_CLOSE       = os.getenv("MARKET_CLOSE", "15:30")
+
+# -- End-of-day square-off ----------------------------------------------------
+# When true, NOTHING carries overnight: at EOD every open paper position is
+# closed at the day's last price and every still-active call (triggered or not)
+# is force-closed — so each trading day starts flat with fresh calls only.
+# When false, the old behaviour applies: only options expiring today are settled
+# and only unfilled entries are cancelled; in-trade calls on still-valid
+# contracts carry to the next day.
+EOD_SQUARE_OFF_ALL = os.getenv("EOD_SQUARE_OFF_ALL", "true").lower() == "true"
 
 # -- Live generation engine ---------------------------------------------------
 # index_option calls are event-driven: regenerate when the market actually moves,

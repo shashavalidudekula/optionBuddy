@@ -21,14 +21,11 @@ Cash model (keeps equity internally consistent):
     SELL entry: cash += qty×entry      exit: cash -= qty×exit   pnl = qty×(entry-exit)
 """
 
-import json
 import math
-import os
 from datetime import datetime
 
 from config.logger import get_logger
 from config.settings import (
-    LOG_DIR,
     MIN_CONFIDENCE,
     PAPER_CATEGORIES,
     PAPER_DAILY_LOSS_PCT,
@@ -42,6 +39,9 @@ from config.settings import (
 from core.market_data_provider import get_lot_size, option_expiry_for
 from core.call_tracker import t1_locked_stop
 from core.execution import PaperBroker
+# Durable closed-trade ledger (survives capital resets). read_paper_day is
+# re-exported here so existing imports (Telegram /paper) keep working.
+from data.paper_history import append_history, read_paper_day  # noqa: F401
 from data.advisory_store import (
     book_paper_exit,
     compute_paper_equity,
@@ -71,54 +71,6 @@ def _pnl_cash(action: str, entry: float, exit_price: float, qty: int) -> tuple[f
     if action == "BUY":
         return round((exit_price - entry) * qty, 2), round(qty * exit_price, 2)
     return round((entry - exit_price) * qty, 2), round(-qty * exit_price, 2)
-
-
-# ── persistent daily history ───────────────────────────────────────────────────
-# Closed trades are appended to a JSON-lines file on the host-mounted logs volume.
-# It survives a Postgres reset (so the live account can start fresh each day while
-# /paper <date> still shows past days' results).
-_HISTORY_PATH = os.path.join(LOG_DIR, "paper_history.jsonl")
-
-
-def _append_history(rec: dict) -> None:
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(_HISTORY_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec) + "\n")
-    except Exception as e:  # noqa: BLE001
-        log.warning("Paper history append failed: %s", e)
-
-
-def read_paper_day(date_str: str) -> dict:
-    """Aggregate the persisted closed trades for one date (YYYY-MM-DD)."""
-    trades: list[dict] = []
-    try:
-        with open(_HISTORY_PATH, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if rec.get("date") == date_str:
-                    trades.append(rec)
-    except FileNotFoundError:
-        pass
-    pnl = round(sum(float(t.get("pnl", 0) or 0) for t in trades), 2)
-    wins = sum(1 for t in trades if float(t.get("pnl", 0) or 0) > 0)
-    losses = sum(1 for t in trades if float(t.get("pnl", 0) or 0) < 0)
-    return {
-        "date": date_str,
-        "trades": trades,
-        "pnl": pnl,
-        "count": len(trades),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round(100.0 * wins / (wins + losses), 1) if (wins + losses) else 0.0,
-        "return_pct": round(pnl / PAPER_START_CAPITAL * 100, 2) if PAPER_START_CAPITAL else 0.0,
-    }
 
 
 class PaperTrader:
@@ -354,7 +306,8 @@ class PaperTrader:
             log.error("Broker place_exit (%s) failed (%s): %s", kind, pos["instrument"], e)
         self._log_trade(pos, remaining, exit_price, realized, kind)
         label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY",
-                 "invalidated": "🔄 PAPER CUT (trend reversed)"}.get(kind, "PAPER CLOSE")
+                 "invalidated": "🔄 PAPER CUT (trend reversed)",
+                 "eod": "🌙 PAPER EOD square-off"}.get(kind, "PAPER CLOSE")
         emoji = "✅" if realized >= 0 else "❌"
         return (f"{label} <b>{pos['instrument']}</b> ×{remaining} @ ₹{exit_price:,.2f} "
                 f"{emoji} ₹{realized:,.0f}")
@@ -363,9 +316,11 @@ class PaperTrader:
     def _log_trade(pos: dict, qty, exit_price, realized, kind: str) -> None:
         """Append a closed-trade record to the durable daily history."""
         now = datetime.now()
-        _append_history({
+        append_history({
             "date": now.strftime("%Y-%m-%d"),
             "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "position_id": int(pos["id"]) if pos.get("id") is not None else None,
+            "call_id": pos.get("call_id"),
             "instrument": pos.get("instrument"),
             "underlying": pos.get("underlying"),
             "category": pos.get("category"),
@@ -415,6 +370,40 @@ class PaperTrader:
             note = self._close({"id": cid}, float(price), "expiry")
             if note:
                 log.info("PAPER EXPIRY SETTLE %s (expiry %s) @ %.2f", pos.get("instrument"), exp, float(price))
+                notes.append(note)
+        return notes
+
+    # ── EOD square-off ───────────────────────────────────────────────────────────
+
+    def square_off_all(self, price_lookup) -> list[str]:
+        """Close EVERY open position at the day's last price — nothing carries over.
+
+        Used at EOD when EOD_SQUARE_OFF_ALL is on. Mirrors settle_expiry but with
+        no expiry filter: every contract is exited at the live premium (falling
+        back to last_price/entry when the feed is already down after close).
+        """
+        from data.advisory_store import get_call_levels
+
+        notes: list[str] = []
+        open_pos = get_open_paper_positions()
+        if not open_pos:
+            return notes
+        levels = get_call_levels([p.get("call_id") for p in open_pos])
+        for pos in open_pos:
+            cid = pos.get("call_id")
+            mini = {"category": pos.get("category"), "underlying": pos.get("underlying"),
+                    "instrument": pos.get("instrument"),
+                    "option_expiry": (levels.get(cid) or {}).get("option_expiry")}
+            price = None
+            try:
+                price = price_lookup(mini)
+            except Exception:  # noqa: BLE001
+                price = None
+            if price is None:
+                price = float(pos["last_price"]) if pos["last_price"] is not None else float(pos["entry_price"])
+            note = self._close({"id": cid}, float(price), "eod")
+            if note:
+                log.info("PAPER EOD SQUARE-OFF %s @ %.2f", pos.get("instrument"), float(price))
                 notes.append(note)
         return notes
 

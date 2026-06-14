@@ -28,9 +28,9 @@ from datetime import datetime, time as dtime
 from config.logger import get_logger
 from config.settings import (
     POLL_INTERVAL_SEC, MARKET_OPEN, MARKET_CLOSE, PAPER_TRADING_ENABLED,
-    PAPER_RESET_ON_START, PAPER_START_CAPITAL,
+    PAPER_RESET_ON_START, PAPER_START_CAPITAL, PAPER_WEEKLY_RESET,
     OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
-    OTHER_GEN_INTERVAL_MIN, ATM_STEP,
+    OTHER_GEN_INTERVAL_MIN, ATM_STEP, EOD_SQUARE_OFF_ALL,
 )
 from data.advisory_store import (
     CATEGORIES,
@@ -39,9 +39,11 @@ from data.advisory_store import (
     active_instruments,
     get_track_record,
     get_active_calls,
+    get_paper_account,
+    reset_paper_account,
 )
 from signals.advisory_engine import generate_calls
-from core.call_tracker import track_active_calls, sweep_stale_calls
+from core.call_tracker import track_active_calls, sweep_stale_calls, force_close_all_calls
 from core.paper_trader import PaperTrader
 from core.execution import get_broker
 from core.market_data_provider import (
@@ -63,7 +65,10 @@ BRIEFING_AFTER = dtime(8, 30)
 # Pre-market scan at 9:08 AM (market opens at 9:15, pre-market closes at 9:08).
 # This gives 7 minutes to prepare for opening-level breakouts.
 PREMARKET_SCAN = dtime(9, 8)
-# Run the EOD digest after the market closes.
+# Square off / close all calls 1 min BEFORE the 15:30 close — the feed is still
+# live, so positions exit at real premiums and live orders can actually fill.
+EOD_CLOSE_AFTER = dtime(15, 29)
+# Broadcast the EOD digest after the market has closed.
 EOD_AFTER = dtime(15, 35)
 
 
@@ -370,7 +375,16 @@ async def run() -> None:
     last_other_gen: datetime | None = None
     briefing_date = None
     premarket_date = None
+    eod_close_date = None
     eod_date = None
+
+    # Seed the weekly-reset marker from when the account was last (re)created, so a
+    # mid-week restart doesn't wipe a week that already started fresh. (year, week).
+    last_reset_week = None
+    if PAPER_TRADING_ENABLED and PAPER_WEEKLY_RESET:
+        acct = get_paper_account()
+        if acct and acct.get("created_at"):
+            last_reset_week = acct["created_at"].isocalendar()[:2]
 
     log.info("Advisory orchestrator started (poll=%ss, premarket=9:08, options=event-driven, others=%smin)",
              POLL_INTERVAL_SEC, OTHER_GEN_INTERVAL_MIN)
@@ -392,6 +406,24 @@ async def run() -> None:
         while True:
             now = datetime.now()
             today = now.date()
+
+            # Weekly fresh start — on the first loop of a new ISO week, wipe the
+            # paper account back to PAPER_START_CAPITAL. Durable history (jsonl)
+            # is untouched, so the Weekly/Daily P&L tables keep the full record.
+            if PAPER_TRADING_ENABLED and PAPER_WEEKLY_RESET:
+                cur_week = now.isocalendar()[:2]
+                if cur_week != last_reset_week:
+                    try:
+                        await asyncio.to_thread(reset_paper_account, PAPER_START_CAPITAL)
+                        log.info("Weekly fresh start — paper account reset to ₹%.0f (ISO week %s)",
+                                 PAPER_START_CAPITAL, cur_week)
+                        await bot.notify_owner(
+                            f"🗓️ <b>New week — fresh start.</b>\n"
+                            f"Paper account reset to ₹{PAPER_START_CAPITAL:,.0f}. "
+                            f"Last week's results are saved in the Weekly P&L table.")
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Weekly reset failed: %s", e)
+                    last_reset_week = cur_week
 
             # Pre-market scan at 9:08 AM — generate calls based on opening levels.
             # Market opens at 9:15, so this gives 7 minutes to prepare for opening breakouts.
@@ -452,28 +484,54 @@ async def run() -> None:
                         log.error("Other-category generation failed: %s", e)
                     last_other_gen = now
 
-            # EOD digest — once per trading day, after close.
-            if (_is_weekday(now) and now.time() >= EOD_AFTER and eod_date != today):
-                # Settle paper positions whose options expire today (cash-settled at close).
-                if paper is not None:
+            # EOD close — 1 min before the close, while the feed is still live.
+            if (_is_weekday(now) and now.time() >= EOD_CLOSE_AFTER and eod_close_date != today):
+                if EOD_SQUARE_OFF_ALL:
+                    # Hard EOD rule: nothing carries overnight. Close EVERY open
+                    # paper position at the day's last price, then force-close
+                    # EVERY still-active call (in-trade booked, unfilled cancelled).
+                    if paper is not None:
+                        try:
+                            notes = await asyncio.to_thread(paper.square_off_all, price_lookup)
+                            for note in notes:
+                                await bot.notify_owner(note)
+                            if notes:
+                                log.info("EOD square-off closed %s position(s)", len(notes))
+                        except Exception as e:
+                            log.error("EOD square-off failed: %s", e)
                     try:
-                        notes = await asyncio.to_thread(paper.settle_expiry, price_lookup, today)
-                        for note in notes:
-                            await bot.notify_owner(note)
-                        if notes:
-                            log.info("Expiry settlement closed %s position(s)", len(notes))
+                        closed = await asyncio.to_thread(force_close_all_calls, price_lookup)
+                        for evt in closed:
+                            await bot.push_call_event(evt)
+                        if closed:
+                            log.info("EOD square-off closed %s call(s)", len(closed))
                     except Exception as e:
-                        log.error("Expiry settlement failed: %s", e)
-                # EOD rule: no call carries overnight waiting for its trigger —
-                # cancel every unfilled entry; tomorrow's market gets fresh calls.
-                try:
-                    swept = await asyncio.to_thread(sweep_stale_calls)
-                    for evt in swept:
-                        await bot.push_call_event(evt)
-                    if swept:
-                        log.info("EOD sweep closed %s stale call(s)", len(swept))
-                except Exception as e:
-                    log.error("EOD call sweep failed: %s", e)
+                        log.error("EOD call square-off failed: %s", e)
+                else:
+                    # Settle paper positions whose options expire today (cash-settled at close).
+                    if paper is not None:
+                        try:
+                            notes = await asyncio.to_thread(paper.settle_expiry, price_lookup, today)
+                            for note in notes:
+                                await bot.notify_owner(note)
+                            if notes:
+                                log.info("Expiry settlement closed %s position(s)", len(notes))
+                        except Exception as e:
+                            log.error("Expiry settlement failed: %s", e)
+                    # EOD rule: no call carries overnight waiting for its trigger —
+                    # cancel every unfilled entry; tomorrow's market gets fresh calls.
+                    try:
+                        swept = await asyncio.to_thread(sweep_stale_calls)
+                        for evt in swept:
+                            await bot.push_call_event(evt)
+                        if swept:
+                            log.info("EOD sweep closed %s stale call(s)", len(swept))
+                    except Exception as e:
+                        log.error("EOD call sweep failed: %s", e)
+                eod_close_date = today
+
+            # EOD digest — once per trading day, after the market has closed.
+            if (_is_weekday(now) and now.time() >= EOD_AFTER and eod_date != today):
                 try:
                     await send_eod_summary(bot)
                 except Exception as e:
