@@ -31,7 +31,8 @@ from config.settings import (
     PAPER_RESET_ON_START, PAPER_START_CAPITAL, PAPER_WEEKLY_RESET,
     OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
     OTHER_GEN_INTERVAL_MIN, ATM_STEP, EOD_SQUARE_OFF_ALL,
-    GEN_HALT_TIME, EOD_CLOSE_TIME, EOD_DIGEST_TIME,
+    GEN_HALT_TIME, EOD_CLOSE_TIME, EOD_DIGEST_TIME, GEN_RESUME_TIME,
+    OPENING_SCALP_ENABLED,
 )
 from data.advisory_store import (
     CATEGORIES,
@@ -48,6 +49,7 @@ from core.call_tracker import (
     track_active_calls, sweep_stale_calls, force_close_all_calls, cancel_waiting_calls,
 )
 from core.paper_trader import PaperTrader
+from core.opening_scalp import OpeningScalp
 from core.execution import get_broker
 from core.market_data_provider import (
     get_session,
@@ -85,6 +87,8 @@ _CLOSE_T = _parse_hhmm(MARKET_CLOSE)
 GEN_HALT_AFTER = _parse_hhmm(GEN_HALT_TIME)
 EOD_CLOSE_AFTER = _parse_hhmm(EOD_CLOSE_TIME)
 EOD_AFTER = _parse_hhmm(EOD_DIGEST_TIME)
+# Normal (LLM) generation is suppressed until this time (default = open, no effect).
+GEN_RESUME_AFTER = _parse_hhmm(GEN_RESUME_TIME)
 
 
 def _is_weekday(now: datetime) -> bool:
@@ -383,6 +387,11 @@ async def run() -> None:
         except Exception as e:
             log.error("Paper trader init failed (%s); continuing without it.", e)
 
+    # Deterministic opening gap-fade scalp (OFF unless OPENING_SCALP_ENABLED).
+    scalp = OpeningScalp(session, paper) if (OPENING_SCALP_ENABLED and paper is not None) else None
+    if scalp is not None:
+        log.info("Opening gap scalp ENABLED — normal generation suppressed until %s", GEN_RESUME_TIME)
+
     opt_trigger = OptionGenTrigger()
     other_categories = [c for c in CATEGORIES if c != "index_option"]
     last_other_gen: datetime | None = None
@@ -467,16 +476,24 @@ async def run() -> None:
                 briefing_date = today
 
             if _in_market_hours(now):
+                # 0) Opening gap-fade scalp — deterministic, runs in the first minutes.
+                if scalp is not None:
+                    try:
+                        for note in await asyncio.to_thread(scalp.step, now, price_lookup):
+                            await bot.notify_owner(note)
+                    except Exception as e:
+                        log.error("Opening scalp step failed: %s", e)
+
                 # 1) Lifecycle tracking every poll — the near-real-time entry/exit layer.
                 try:
                     await run_tracking_pass(bot, price_lookup, paper)
                 except Exception as e:
                     log.error("Tracking pass failed: %s", e)
 
-                # No NEW trades in the final minutes: halt all generation before the
-                # 15:28 pre-close cancel, so nothing fresh can trigger after the
-                # square-off and carry overnight. Tracking (above) keeps running.
-                if now.time() < GEN_HALT_AFTER:
+                # Generation window: not before GEN_RESUME_AFTER (lets the opening
+                # scalp own the first minutes) and not after GEN_HALT_AFTER (so
+                # nothing fresh triggers near the close and carries overnight).
+                if GEN_RESUME_AFTER <= now.time() < GEN_HALT_AFTER:
                     # 2) Event-driven index-option generation — fire when the market moves.
                     #    Skip when spots are unavailable (e.g. feed hiccup) so we don't
                     #    fire blindly or hammer the quote API without ATM grounding.

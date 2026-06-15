@@ -165,6 +165,24 @@ EOD_SQUARE_OFF_ALL = os.getenv("EOD_SQUARE_OFF_ALL", "true").lower() == "true"
 GEN_HALT_TIME   = os.getenv("GEN_HALT_TIME", "15:28")
 EOD_CLOSE_TIME  = os.getenv("EOD_CLOSE_TIME", "15:29")
 EOD_DIGEST_TIME = os.getenv("EOD_DIGEST_TIME", "15:35")
+# Suppress NORMAL (LLM) call generation until this time — lets the deterministic
+# opening scalp own the first minutes. Default 09:15 = no suppression.
+GEN_RESUME_TIME = os.getenv("GEN_RESUME_TIME", "09:15")
+
+# -- Opening gap scalp (deterministic, no LLM) --------------------------------
+# Fade the opening gap: big gap-UP -> buy ATM PE (the follow-through fades);
+# big gap-DOWN -> buy ATM CE (the dip bounces). ONE quick trade at the open,
+# held a few minutes then closed before the market reconsolidates. Validated on
+# 1-min Dhan data — a thin, execution-sensitive edge, so it ships OFF by default;
+# enable in paper to measure it (P&L is net of PAPER_COST_PER_TRADE).
+OPENING_SCALP_ENABLED = os.getenv("OPENING_SCALP_ENABLED", "false").lower() == "true"
+SCALP_UNDERLYING      = os.getenv("SCALP_UNDERLYING", "NIFTY").upper()
+SCALP_GAP_MIN_PCT     = float(os.getenv("SCALP_GAP_MIN_PCT", "0.4"))   # min |gap| to act
+SCALP_GAPUP_ENTRY_MIN = int(os.getenv("SCALP_GAPUP_ENTRY_MIN", "2"))   # min after open to buy PE
+SCALP_GAPDN_ENTRY_MIN = int(os.getenv("SCALP_GAPDN_ENTRY_MIN", "1"))   # min after open to buy CE
+SCALP_HOLD_MIN        = int(os.getenv("SCALP_HOLD_MIN", "4"))          # hard exit after N minutes
+SCALP_TARGET_PCT      = float(os.getenv("SCALP_TARGET_PCT", "0"))      # premium % target (0 = timer only)
+SCALP_STOP_PCT        = float(os.getenv("SCALP_STOP_PCT", "0"))        # premium % stop   (0 = timer only)
 
 # -- Live generation engine ---------------------------------------------------
 # index_option calls are event-driven: regenerate when the market actually moves,
