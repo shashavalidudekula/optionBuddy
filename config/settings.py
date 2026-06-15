@@ -112,6 +112,12 @@ PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # b
 # charged ONCE per position when it fully closes, so paper P&L reflects what you'd
 # actually net. Realistic intraday option strategies live or die on this number.
 PAPER_COST_PER_TRADE    = float(os.getenv("PAPER_COST_PER_TRADE", "100"))
+# Per-trade risk cap (bound the worst-case loss on ANY single trade). A pricey
+# BankNifty premium with a wide stop can lose ₹10k on one SL hit, blowing the
+# day's budget. Size every position so its worst case (entry→SL) is at most the
+# SMALLER of PAPER_RISK_PCT×equity and this absolute rupee cap; if even one lot
+# would exceed it, the trade is skipped (logged/flagged 'risk_skip').
+PAPER_MAX_LOSS_PER_TRADE = float(os.getenv("PAPER_MAX_LOSS_PER_TRADE", "2000"))
 # Categories the paper trader will act on. Scope: long options + stocks only —
 # NO futures and NO short positions (those need a margin model; out of scope).
 PAPER_CATEGORIES        = tuple(
@@ -195,6 +201,18 @@ PROFIT_LOCK_FRACTION   = float(os.getenv("PROFIT_LOCK_FRACTION", "0.5"))   # fra
 PROFIT_TRAIL_KEEP      = float(os.getenv("PROFIT_TRAIL_KEEP", "0.5"))      # frac of the favorable move locked into SL
 PROFIT_STALL_FRACTION  = float(os.getenv("PROFIT_STALL_FRACTION", "0.3"))  # min frac toward T1 to count as "in profit"
 PROFIT_STALL_MINUTES   = int(os.getenv("PROFIT_STALL_MINUTES", "10"))      # in profit this long but no T1 → book partial
+
+# -- ATR-based target sizing (realistic, volatility-scaled option levels) ------
+# Round-number targets ignore today's volatility (BankNifty's "100-pt" gaps).
+# Instead derive SL/T1/T2 on the PREMIUM from the underlying's intraday 5-min ATR
+# × the strike's delta. Distances are clamped to a sane % of premium so an odd ATR
+# can't produce absurd levels; falls back to the model's own levels when data is thin.
+ATR_SIZING_ENABLED   = os.getenv("ATR_SIZING_ENABLED", "true").lower() == "true"
+ATR_HORIZON_BARS     = int(os.getenv("ATR_HORIZON_BARS", "3"))      # 5-min bars of expected hold move
+ATR_SL_MULT          = float(os.getenv("ATR_SL_MULT", "1.0"))
+ATR_T1_MULT          = float(os.getenv("ATR_T1_MULT", "1.5"))
+ATR_T2_MULT          = float(os.getenv("ATR_T2_MULT", "3.0"))
+DEFAULT_OPTION_DELTA = float(os.getenv("DEFAULT_OPTION_DELTA", "0.5"))
 
 # -- Instruments (INDstocks security_ids) ------------------------------------
 TRACKED_INDICES    = os.getenv("TRACKED_INDICES", "13,25,1").split(",")      # Nifty50, BankNifty, VIX

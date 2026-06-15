@@ -371,7 +371,7 @@ function render(s){
     'short', cc.length>40?('showing 40 of '+cc.length):'');
 
   // Generated but NOT executed (capital exhausted / position cap / loss halt)
-  const REASON = {unfunded:"capital exhausted", capped:"max positions", halted_daily_loss:"daily-loss halt"};
+  const REASON = {unfunded:"capital exhausted", capped:"max positions", halted_daily_loss:"daily-loss halt", risk_skip:"per-trade risk cap"};
   const ne = s.calls.not_executed || [];
   document.getElementById('notexec').innerHTML = capBox('Generated · Not Executed', 'no capital / limits', ne.length, tbl(
     [{t:"Cat",l:1},{t:"Side"},{t:"Instrument",l:1},{t:"Reason"},{t:"Conf"},{t:"Time",l:1}],

@@ -528,7 +528,7 @@ def get_not_executed_calls(limit: int = 60) -> list[dict]:
     try:
         cur.execute(
             "SELECT * FROM calls WHERE paper_status IN "
-            "('unfunded', 'capped', 'halted_daily_loss') ORDER BY issued_at DESC LIMIT %s",
+            "('unfunded', 'capped', 'halted_daily_loss', 'risk_skip') ORDER BY issued_at DESC LIMIT %s",
             (limit,),
         )
         rows = cur.fetchall()

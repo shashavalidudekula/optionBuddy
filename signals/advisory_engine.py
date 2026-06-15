@@ -19,11 +19,32 @@ import json
 import re
 from datetime import datetime, time as dtime
 
-from config.settings import MIN_CONFIDENCE
+from config.settings import (
+    MIN_CONFIDENCE,
+    ATR_SIZING_ENABLED,
+    ATR_HORIZON_BARS,
+    ATR_SL_MULT,
+    ATR_T1_MULT,
+    ATR_T2_MULT,
+    DEFAULT_OPTION_DELTA,
+)
 from config.logger import get_logger
 from core.llm import generate, LLMError, LLMQuotaError
 
 log = get_logger("advisory_engine")
+
+# Clamp ATR-derived distances to a sane fraction of the entry premium, so an
+# unusual ATR (or a thin early-session read) can't produce absurd SL/T1/T2.
+_ATR_SL_PCT = (0.12, 0.35)   # stop distance: 12%–35% of premium
+_ATR_T1_PCT = (0.15, 0.80)   # target-1 distance
+_ATR_T2_PCT = (0.30, 1.50)   # target-2 distance
+
+
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 # Opening window (IST): trade the opening-range breakout, not chop inside it.
 _OPENING_START = dtime(9, 15)
@@ -180,6 +201,65 @@ def _parse_calls(raw: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+def _delta_for(call: dict, market_data: dict) -> float | None:
+    """Look up the chosen strike's delta from the option chain in the snapshot."""
+    chain = (market_data.get("option_chain") or {}).get(str(call.get("underlying", "")).upper())
+    if not chain:
+        return None
+    m = _OPTION_RE.search(str(call.get("instrument", "")))
+    if not m:
+        return None
+    strike, ot = int(m.group(1)), m.group(2).upper()
+    for row in chain.get("strikes", []):
+        if int(row.get("strike", 0)) == strike and str(row.get("option_type", "")).upper() == ot:
+            return _f(row.get("delta"))
+    return None
+
+
+def _clamp(dist: float, entry: float, bounds: tuple[float, float]) -> float:
+    lo, hi = entry * bounds[0], entry * bounds[1]
+    return min(max(dist, lo), hi)
+
+
+def _size_by_atr(call: dict, market_data: dict) -> None:
+    """Override an option call's SL/T1/T2 with volatility-scaled premium levels.
+
+    Move budget = intraday 5-min ATR (index pts) × ATR_HORIZON_BARS × |delta|,
+    converted to premium points. SL/T1/T2 are multiples of that, each clamped to a
+    sane % of the entry premium. Best-effort: leaves the model's levels untouched
+    when ATR/delta data is missing. Only applies to index options.
+    """
+    if not ATR_SIZING_ENABLED or call.get("category") != "index_option":
+        return
+    undl = str(call.get("underlying", "")).upper()
+    intr = (market_data.get("intraday") or {}).get(undl) or {}
+    atr5 = _f(intr.get("atr14_5m"))
+    entry = _f(call.get("entry_price"))
+    if not atr5 or not entry or entry <= 0:
+        return
+    delta = abs(_delta_for(call, market_data) or DEFAULT_OPTION_DELTA) or DEFAULT_OPTION_DELTA
+    unit = atr5 * max(ATR_HORIZON_BARS, 1) * delta   # expected premium move over the hold
+    if unit <= 0:
+        return
+    sl_d = _clamp(ATR_SL_MULT * unit, entry, _ATR_SL_PCT)
+    t1_d = _clamp(ATR_T1_MULT * unit, entry, _ATR_T1_PCT)
+    t2_d = _clamp(ATR_T2_MULT * unit, entry, _ATR_T2_PCT)
+    action = str(call.get("action", "")).upper()
+    if action == "BUY":
+        call["stop_loss"] = round(entry - sl_d, 1)
+        call["target_1"] = round(entry + t1_d, 1)
+        call["target_2"] = round(entry + t2_d, 1)
+    elif action == "SELL":
+        call["stop_loss"] = round(entry + sl_d, 1)
+        call["target_1"] = round(max(entry - t1_d, 0.05), 1)
+        call["target_2"] = round(max(entry - t2_d, 0.05), 1)
+    else:
+        return
+    log.info("ATR-sized %s: entry %.1f → T1 %.1f / T2 %.1f / SL %.1f (atr5 %.1f, delta %.2f)",
+             call.get("instrument"), entry, call["target_1"], call["target_2"],
+             call["stop_loss"], atr5, delta)
+
+
 def _is_valid(call: dict) -> bool:
     """Validate required fields exist and price relationships are coherent."""
     for f in _REQUIRED_FIELDS:
@@ -250,6 +330,11 @@ def generate_calls(
             undl = str(call.get("underlying", "")).upper().strip()
             if m and undl:
                 call["instrument"] = f"{undl} {int(m.group(1))} {m.group(2).upper()}"
+            # Replace the model's round-number levels with volatility-scaled ones.
+            try:
+                _size_by_atr(call, market_data)
+            except Exception as e:  # noqa: BLE001
+                log.debug("ATR sizing skipped (%s): %s", call.get("instrument"), e)
 
         # An index can't be a cash-equity trade; reject so we don't publish
         # untradeable "SELL NIFTY (equity)" ideas. Indices → options/futures.

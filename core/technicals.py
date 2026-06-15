@@ -194,6 +194,7 @@ def _compute_intraday(symbol: str, ticker: str) -> dict | None:
     ema9 = _ema(closes, 9)
     ema21 = _ema(closes, 21)
     rsi14 = _rsi(closes, 14)  # None until ~15 bars exist
+    atr14_5m = _atr(highs, lows, closes, 14)  # 5-min ATR in index points (for sizing)
 
     # VWAP (only meaningful when the feed carries volume).
     vwap = None
@@ -241,6 +242,7 @@ def _compute_intraday(symbol: str, ticker: str) -> dict | None:
         "pct_from_day_low": pct_from_day_low,
         "last_extreme": last_extreme,
         "rsi14_5m": rsi14,
+        "atr14_5m": atr14_5m,
         "ema9_5m": round(ema9, 2) if ema9 is not None else None,
         "ema21_5m": round(ema21, 2) if ema21 is not None else None,
         "vwap": vwap,
