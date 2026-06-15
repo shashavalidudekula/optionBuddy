@@ -676,6 +676,24 @@ def do_exit_call(call_id: int) -> str:
     return "\n".join(out)
 
 
+def do_cancel_call(call_id: int) -> str:
+    """Cancel a call that's still WAITING for entry (not yet triggered)."""
+    from data.advisory_store import get_call, update_call_status
+
+    call = get_call(call_id)
+    if not call:
+        return f"ℹ️ No call <b>#{call_id}</b> found."
+    if call.get("status") in ("target_hit", "sl_hit", "expired", "closed"):
+        return f"ℹ️ Call <b>#{call_id}</b> is already closed."
+    if call.get("entry_triggered"):
+        return (f"⚠️ Call <b>#{call_id}</b> ({html.escape(str(call.get('instrument')))}) is already "
+                f"in trade — use <code>/exit {call_id}</code> to close it at the current price.")
+    update_call_status(call_id, "closed")
+    log.info("Manual /cancel cancelled waiting call #%s (%s)", call_id, call.get("instrument"))
+    return (f"🚫 <b>Cancelled #{call_id}</b> — {html.escape(str(call.get('instrument')))} "
+            f"(was waiting for entry).")
+
+
 def do_set_sl(call_id: int, new_sl: float) -> str:
     """Adjust a live call's stop-loss to `new_sl` (Telegram /sl)."""
     from data.advisory_store import get_call, update_call_status
@@ -711,6 +729,7 @@ class TelegramAdvisoryBot:
         self.app.add_handler(CommandHandler("paper", self._cmd_paper))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("exit", self._cmd_exit))
+        self.app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         self.app.add_handler(CommandHandler("sl", self._cmd_sl))
         self.app.add_handler(CommandHandler("why", self._cmd_why))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
@@ -882,6 +901,20 @@ class TelegramAdvisoryBot:
         report = await asyncio.to_thread(do_exit_call, int(arg))
         await update.message.reply_text(report, parse_mode="HTML")
 
+    async def _cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cancel a waiting (not-yet-triggered) call (owner only): /cancel <call_id>."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /cancel is restricted to the account owner.")
+            return
+        arg = (ctx.args[0] if getattr(ctx, "args", None) else "").lstrip("#").strip()
+        if not arg.isdigit():
+            await update.message.reply_text(
+                "Use <code>/cancel &lt;call_id&gt;</code> — cancels a call still waiting for entry. "
+                "For a call already in trade, use <code>/exit &lt;id&gt;</code>.", parse_mode="HTML")
+            return
+        report = await asyncio.to_thread(do_cancel_call, int(arg))
+        await update.message.reply_text(report, parse_mode="HTML")
+
     async def _cmd_sl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Adjust a call's stop-loss (owner only): /sl <call_id> <price>."""
         if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
@@ -978,6 +1011,7 @@ class TelegramAdvisoryBot:
             "• /status — active LLM, data feed & mode + scan cadence (owner only)\n"
             "• /why &lt;id&gt; — why a call was taken + the inputs it saw (owner only)\n"
             "• /exit &lt;id&gt; — close a call now at the current price (owner only)\n"
+            "• /cancel &lt;id&gt; — cancel a call still waiting for entry (owner only)\n"
             "• /sl &lt;id&gt; &lt;price&gt; — adjust a call's stop-loss (owner only)\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
