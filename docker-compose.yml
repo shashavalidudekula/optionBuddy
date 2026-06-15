@@ -67,9 +67,10 @@ services:
       PYTHONUNBUFFERED: 1
       TZ: Asia/Kolkata
     volumes:
-      # Read the durable paper-history ledger the engine writes, so the
-      # Daily/Weekly P&L tables can see every closed trade (incl. manual /exit).
-      - ./logs:/app/logs:ro
+      # Share the logs dir: reads the paper-history ledger for the Daily/Weekly
+      # P&L tables, and writes its own dated log file. Must be read-write — the
+      # logger opens agent-<date>.log for writing on startup (a :ro mount crashes it).
+      - ./logs:/app/logs
     ports:
       - "8000:8000"
     networks:
