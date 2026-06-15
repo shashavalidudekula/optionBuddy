@@ -238,6 +238,24 @@ def sweep_stale_calls(now: datetime | None = None) -> list[dict]:
     return events
 
 
+def cancel_waiting_calls(now: datetime | None = None) -> list[dict]:
+    """Cancel every call still WAITING for entry (untriggered). Price-free.
+
+    Used at the pre-close gen-halt (15:28) so no untriggered call can fill in the
+    final minutes and carry overnight. In-trade calls are left for the square-off.
+    """
+    now = now or datetime.now()
+    events: list[dict] = []
+    for call in get_active_calls():
+        if call.get("entry_triggered"):
+            continue
+        update_call_status(call["id"], "closed")
+        log.info("Call #%s cancelled — still waiting at pre-close (%s)",
+                 call["id"], call["instrument"])
+        events.append(_make_event(call, "unfilled", _f(call.get("last_price")), None))
+    return events
+
+
 def force_close_all_calls(price_lookup: PriceLookup | None = None,
                           now: datetime | None = None) -> list[dict]:
     """EOD square-off: close EVERY active call so nothing carries overnight.

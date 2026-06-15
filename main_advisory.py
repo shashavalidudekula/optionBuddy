@@ -43,7 +43,9 @@ from data.advisory_store import (
     reset_paper_account,
 )
 from signals.advisory_engine import generate_calls
-from core.call_tracker import track_active_calls, sweep_stale_calls, force_close_all_calls
+from core.call_tracker import (
+    track_active_calls, sweep_stale_calls, force_close_all_calls, cancel_waiting_calls,
+)
 from core.paper_trader import PaperTrader
 from core.execution import get_broker
 from core.market_data_provider import (
@@ -65,8 +67,12 @@ BRIEFING_AFTER = dtime(8, 30)
 # Pre-market scan at 9:08 AM (market opens at 9:15, pre-market closes at 9:08).
 # This gives 7 minutes to prepare for opening-level breakouts.
 PREMARKET_SCAN = dtime(9, 8)
-# Square off / close all calls 1 min BEFORE the 15:30 close — the feed is still
-# live, so positions exit at real premiums and live orders can actually fill.
+# Stop opening NEW trades and cancel everything still waiting for entry 2 min
+# before the close — so nothing fresh can trigger after the square-off and carry
+# overnight. (Tracking of in-trade calls continues.)
+GEN_HALT_AFTER = dtime(15, 28)
+# Square off / close all in-trade calls 1 min BEFORE the 15:30 close — the feed is
+# still live, so positions exit at real premiums and live orders can actually fill.
 EOD_CLOSE_AFTER = dtime(15, 29)
 # Broadcast the EOD digest after the market has closed.
 EOD_AFTER = dtime(15, 35)
@@ -375,6 +381,7 @@ async def run() -> None:
     last_other_gen: datetime | None = None
     briefing_date = None
     premarket_date = None
+    gen_halt_date = None
     eod_close_date = None
     eod_date = None
 
@@ -459,30 +466,48 @@ async def run() -> None:
                 except Exception as e:
                     log.error("Tracking pass failed: %s", e)
 
-                # 2) Event-driven index-option generation — fire when the market moves.
-                #    Skip when spots are unavailable (e.g. feed hiccup) so we don't
-                #    fire blindly or hammer the quote API without ATM grounding.
-                if session is not None:
-                    try:
-                        spots = await asyncio.to_thread(get_index_spots, session)
-                        if spots:
-                            fire, reason, idxs = opt_trigger.check(spots)
-                            if fire:
-                                log.info("Option scan triggered (%s)", reason or "—")
-                                await run_generation_cycle(bot, session, ["index_option"], indices=idxs)
-                                opt_trigger.commit(spots)
-                    except Exception as e:
-                        log.error("Option generation failed: %s", e)
+                # No NEW trades in the final minutes: halt all generation before the
+                # 15:28 pre-close cancel, so nothing fresh can trigger after the
+                # square-off and carry overnight. Tracking (above) keeps running.
+                if now.time() < GEN_HALT_AFTER:
+                    # 2) Event-driven index-option generation — fire when the market moves.
+                    #    Skip when spots are unavailable (e.g. feed hiccup) so we don't
+                    #    fire blindly or hammer the quote API without ATM grounding.
+                    if session is not None:
+                        try:
+                            spots = await asyncio.to_thread(get_index_spots, session)
+                            if spots:
+                                fire, reason, idxs = opt_trigger.check(spots)
+                                if fire:
+                                    log.info("Option scan triggered (%s)", reason or "—")
+                                    await run_generation_cycle(bot, session, ["index_option"], indices=idxs)
+                                    opt_trigger.commit(spots)
+                        except Exception as e:
+                            log.error("Option generation failed: %s", e)
 
-                # 3) Slower cadence for equity/futures/commodity.
-                if other_categories and (
-                        last_other_gen is None
-                        or (now - last_other_gen).total_seconds() >= OTHER_GEN_INTERVAL_MIN * 60):
-                    try:
-                        await run_generation_cycle(bot, session, other_categories)
-                    except Exception as e:
-                        log.error("Other-category generation failed: %s", e)
-                    last_other_gen = now
+                    # 3) Slower cadence for equity/futures/commodity.
+                    if other_categories and (
+                            last_other_gen is None
+                            or (now - last_other_gen).total_seconds() >= OTHER_GEN_INTERVAL_MIN * 60):
+                        try:
+                            await run_generation_cycle(bot, session, other_categories)
+                        except Exception as e:
+                            log.error("Other-category generation failed: %s", e)
+                        last_other_gen = now
+
+            # Pre-close (15:28) — generation is already halted above; now cancel every
+            # call still WAITING for entry so only in-trade calls remain for the 15:29
+            # square-off. Nothing fresh can trigger and carry overnight.
+            if (_is_weekday(now) and now.time() >= GEN_HALT_AFTER and gen_halt_date != today):
+                try:
+                    cancelled = await asyncio.to_thread(cancel_waiting_calls)
+                    for evt in cancelled:
+                        await bot.push_call_event(evt)
+                    if cancelled:
+                        log.info("Pre-close: cancelled %s waiting call(s); new generation halted", len(cancelled))
+                except Exception as e:
+                    log.error("Pre-close waiting-cancel failed: %s", e)
+                gen_halt_date = today
 
             # EOD close — 1 min before the close, while the feed is still live.
             if (_is_weekday(now) and now.time() >= EOD_CLOSE_AFTER and eod_close_date != today):
