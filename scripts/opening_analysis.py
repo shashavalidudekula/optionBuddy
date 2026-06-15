@@ -140,11 +140,29 @@ def main():
         d_close = g[-1]["close"]
         rest = g[3:]
         pc = prev_close_for(day)
+        # Post-opening-range breakout edge: enter at the 9:30 close in the breakout
+        # direction, then measure favourable vs adverse excursion to the close.
+        sig = fav = adv = cm = None
+        if len(g) >= 6:
+            entry = g[3]["close"]
+            post = g[4:]
+            hi_a = max(b["high"] for b in post)
+            lo_a = min(b["low"] for b in post)
+            eod = g[-1]["close"]
+            if entry > f_hi:
+                sig = "long"
+            elif entry < f_lo:
+                sig = "short"
+            if sig == "long":
+                fav, adv, cm = (hi_a - entry) / entry * 100, (entry - lo_a) / entry * 100, (eod - entry) / entry * 100
+            elif sig == "short":
+                fav, adv, cm = (entry - lo_a) / entry * 100, (hi_a - entry) / entry * 100, (entry - eod) / entry * 100
         rows.append({
             "month": str(day)[:7], "gap": _pct(o, pc) if pc else float("nan"),
             "or": (f_hi - f_lo) / o * 100, "f15": _pct(f_close, o), "day": _pct(d_close, o),
             "persist": (_pct(f_close, o) > 0) == (_pct(d_close, o) > 0),
             "whip": any(b["high"] > f_hi for b in rest) and any(b["low"] < f_lo for b in rest),
+            "sig": sig, "fav": fav, "adv": adv, "cm": cm,
             "vix": vix_for(day),
         })
     rows = [r for r in rows if r["gap"] == r["gap"]]  # drop days w/o prev close
@@ -179,6 +197,35 @@ def main():
         sub = [r for r in rows if r["vix"] is not None and lo <= r["vix"] < hi]
         if sub:
             print(f"{label:<14}{len(sub):>4}{rate(sub,'persist'):>10.0f}{rate(sub,'whip'):>10.0f}{faded(sub):>10.0f}")
+
+    print("\n=== POST-OR BREAKOUT EDGE (enter 9:30 in breakout dir, hold to close) ===")
+    print("favourable/adverse = avg max move for/against the trade (% of index); win = closed green")
+
+    def edge(sub):
+        sub = [r for r in sub if r.get("sig") and r["fav"] is not None]
+        if not sub:
+            return None
+        fv = sum(r["fav"] for r in sub) / len(sub)
+        ad = sum(r["adv"] for r in sub) / len(sub)
+        win = 100 * sum(1 for r in sub if r["cm"] > 0) / len(sub)
+        return len(sub), fv, ad, (fv / ad if ad else float("inf")), win
+
+    def show_edge(label, sub):
+        e = edge(sub)
+        if e:
+            print(f"{label:<20}n={e[0]:>3}  fav {e[1]:.2f}%  adv {e[2]:.2f}%  fav/adv {e[3]:.2f}  win {e[4]:.0f}%")
+
+    show_edge("ALL breakouts", rows)
+    print("-- by gap bucket --")
+    show_edge("gap-up >0.6%", [r for r in rows if r["gap"] >= 0.6])
+    show_edge("gap-up 0.3-0.6%", [r for r in rows if 0.3 <= r["gap"] < 0.6])
+    show_edge("gap 0-0.3% (abs)", [r for r in rows if abs(r["gap"]) < 0.3])
+    show_edge("gap-dn 0.3-0.6%", [r for r in rows if -0.6 < r["gap"] <= -0.3])
+    show_edge("gap-dn >0.6%", [r for r in rows if r["gap"] <= -0.6])
+    print("-- by VIX regime --")
+    show_edge("low VIX <14", [r for r in rows if r["vix"] is not None and r["vix"] < 14])
+    show_edge("mid VIX 14-17", [r for r in rows if r["vix"] is not None and 14 <= r["vix"] < 17])
+    show_edge("high VIX >=17", [r for r in rows if r["vix"] is not None and r["vix"] >= 17])
 
     print("\n=== BY MONTH ===")
     print(f"{'month':<9}{'n':>4}{'avg|gap|':>10}{'persist%':>10}{'whipsaw%':>10}{'avgVIX':>8}")
