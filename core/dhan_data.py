@@ -34,7 +34,7 @@ import io
 import re
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import requests
 
@@ -504,6 +504,87 @@ def resolve_scrip_for_call(call: dict) -> str | None:
     if cat == "equity":
         return _equity_scrip(underlying) or _index_scrip(underlying)
     return None  # commodity not wired yet
+
+
+# ── historical candles (official Dhan charts API) ────────────────────────────
+
+def _chart_target(underlying: str):
+    """(securityId:str, exchangeSegment:str, instrument:str) for the charts API."""
+    scrip, seg = _underlying_scrip_seg(underlying)
+    if not scrip:
+        return None
+    instrument = "INDEX" if seg == "IDX_I" else "EQUITY"
+    return str(scrip), seg, instrument
+
+
+def _parse_candles(resp) -> list[dict]:
+    """Normalise a Dhan charts response → [{ts, open, high, low, close, volume}] (oldest first).
+
+    Dhan returns parallel arrays (open/high/low/close/volume/timestamp). Timestamps
+    are epoch seconds; converted with the local tz (the container runs IST).
+    """
+    if not isinstance(resp, dict):
+        return []
+    d = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+    o, h, l, c = d.get("open"), d.get("high"), d.get("low"), d.get("close")
+    t = d.get("timestamp") or d.get("start_Time") or []
+    v = d.get("volume") or []
+    if not (o and h and l and c and t):
+        return []
+    out: list[dict] = []
+    for i in range(min(len(o), len(h), len(l), len(c), len(t))):
+        try:
+            ts = datetime.fromtimestamp(int(t[i]))
+        except (TypeError, ValueError, OSError):
+            ts = None
+        out.append({
+            "ts": ts,
+            "open": float(o[i]), "high": float(h[i]),
+            "low": float(l[i]), "close": float(c[i]),
+            "volume": float(v[i]) if i < len(v) and v[i] is not None else 0.0,
+        })
+    return out
+
+
+def get_historical_intraday(session, underlying: str, interval: str = "5", days: int = 30) -> list[dict]:
+    """Official Dhan intraday candles (interval in minutes: 1/5/15/25/60) for the
+    last `days`. Returns [{ts, open, high, low, close, volume}] oldest-first, or []."""
+    if session is None:
+        return []
+    tgt = _chart_target(underlying)
+    if not tgt:
+        return []
+    sid, seg, instrument = tgt
+    today = date.today()
+    body = {"securityId": sid, "exchangeSegment": seg, "instrument": instrument,
+            "interval": str(interval),
+            "fromDate": (today - timedelta(days=days)).isoformat(),
+            "toDate": today.isoformat()}
+    try:
+        return _parse_candles(session.post("/charts/intraday", json=body))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Dhan intraday history failed for %s: %s", underlying, e)
+        return []
+
+
+def get_historical_daily(session, underlying: str, days: int = 120) -> list[dict]:
+    """Official Dhan daily candles for the last `days`. Oldest-first, or []."""
+    if session is None:
+        return []
+    tgt = _chart_target(underlying)
+    if not tgt:
+        return []
+    sid, seg, instrument = tgt
+    today = date.today()
+    body = {"securityId": sid, "exchangeSegment": seg, "instrument": instrument,
+            "expiryCode": 0,
+            "fromDate": (today - timedelta(days=days)).isoformat(),
+            "toDate": today.isoformat()}
+    try:
+        return _parse_candles(session.post("/charts/historical", json=body))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Dhan daily history failed for %s: %s", underlying, e)
+        return []
 
 
 # ── snapshot / spots / lot size / expiry / price lookup ──────────────────────

@@ -361,6 +361,14 @@ async def run() -> None:
         log.error("Market-data session unavailable (%s). Running with global cues only; "
                   "option/equity tracking will rely on expiry until credentials are set.", e)
 
+    # Let the technicals/tape layer compute on official Dhan candles (reusing this
+    # one session — no second token). Falls back to yfinance if the session is None.
+    try:
+        from core.technicals import set_data_session
+        set_data_session(session)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not register technicals data session: %s", e)
+
     bot = TelegramAdvisoryBot()
     await bot.start_polling()
 

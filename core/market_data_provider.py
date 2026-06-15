@@ -52,6 +52,18 @@ def get_option_chain(session, underlying, count: int = 4):
     return _impl.get_option_chain(session, underlying, count)
 
 
+def get_historical_intraday(session, underlying, interval: str = "5", days: int = 30):
+    """Official intraday candles (Dhan). [] if the provider lacks the endpoint."""
+    fn = getattr(_impl, "get_historical_intraday", None)
+    return fn(session, underlying, interval, days) if fn else []
+
+
+def get_historical_daily(session, underlying, days: int = 120):
+    """Official daily candles (Dhan). [] if the provider lacks the endpoint."""
+    fn = getattr(_impl, "get_historical_daily", None)
+    return fn(session, underlying, days) if fn else []
+
+
 def get_index_spots(session):
     return _impl.get_index_spots(session)
 

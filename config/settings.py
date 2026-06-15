@@ -13,6 +13,11 @@ load_dotenv()
 # Everything goes through core/market_data_provider.py, so dropping INDstocks
 # later is: delete core/indstocks_*.py + remove the one branch in that facade.
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "dhan").lower()
+# Compute RSI/EMA/ATR/VWAP/opening-range/tape on OFFICIAL Dhan candles (real-time)
+# instead of yfinance (delayed/unofficial). Falls back to yfinance automatically
+# when no Dhan session is available or a Dhan history call fails. Set false to
+# force yfinance everywhere.
+TECHNICALS_USE_DHAN = os.getenv("TECHNICALS_USE_DHAN", "true").lower() == "true"
 
 # -- Dhan (DhanHQ v2) ---------------------------------------------------------
 # Auth = client-id + access-token headers. The access token is regenerated daily;
