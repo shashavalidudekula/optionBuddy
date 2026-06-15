@@ -29,7 +29,12 @@ DB_NAME = os.getenv("DB_NAME", "trading_agent")
 DB_USER = os.getenv("DB_USER", "trading_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "trading_password")
 
-CATEGORIES = ("index_option", "equity", "futures")
+# Which categories the engine generates + tracks. Configurable via
+# ADVISORY_CATEGORIES (default: index options only). Anything not listed here is
+# never generated, published, or paper-traded.
+CATEGORIES = tuple(
+    c.strip() for c in os.getenv("ADVISORY_CATEGORIES", "index_option").split(",") if c.strip()
+)
 DEFAULT_CATEGORIES = ",".join(CATEGORIES)
 
 # Terminal statuses (call no longer tracked / scored)
