@@ -154,6 +154,12 @@ MARKET_CLOSE       = os.getenv("MARKET_CLOSE", "15:30")
 # and only unfilled entries are cancelled; in-trade calls on still-valid
 # contracts carry to the next day.
 EOD_SQUARE_OFF_ALL = os.getenv("EOD_SQUARE_OFF_ALL", "true").lower() == "true"
+# EOD close-out schedule (IST, "HH:MM"). At GEN_HALT_TIME new-call generation
+# stops and every waiting (untriggered) call is cancelled; at EOD_CLOSE_TIME all
+# in-trade calls/positions are squared off; the digest broadcasts at EOD_DIGEST_TIME.
+GEN_HALT_TIME   = os.getenv("GEN_HALT_TIME", "15:28")
+EOD_CLOSE_TIME  = os.getenv("EOD_CLOSE_TIME", "15:29")
+EOD_DIGEST_TIME = os.getenv("EOD_DIGEST_TIME", "15:35")
 
 # -- Live generation engine ---------------------------------------------------
 # index_option calls are event-driven: regenerate when the market actually moves,

@@ -31,6 +31,7 @@ from config.settings import (
     PAPER_RESET_ON_START, PAPER_START_CAPITAL, PAPER_WEEKLY_RESET,
     OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
     OTHER_GEN_INTERVAL_MIN, ATM_STEP, EOD_SQUARE_OFF_ALL,
+    GEN_HALT_TIME, EOD_CLOSE_TIME, EOD_DIGEST_TIME,
 )
 from data.advisory_store import (
     CATEGORIES,
@@ -67,17 +68,6 @@ BRIEFING_AFTER = dtime(8, 30)
 # Pre-market scan at 9:08 AM (market opens at 9:15, pre-market closes at 9:08).
 # This gives 7 minutes to prepare for opening-level breakouts.
 PREMARKET_SCAN = dtime(9, 8)
-# Stop opening NEW trades and cancel everything still waiting for entry 2 min
-# before the close — so nothing fresh can trigger after the square-off and carry
-# overnight. (Tracking of in-trade calls continues.)
-GEN_HALT_AFTER = dtime(15, 28)
-# Square off / close all in-trade calls 1 min BEFORE the 15:30 close — the feed is
-# still live, so positions exit at real premiums and live orders can actually fill.
-EOD_CLOSE_AFTER = dtime(15, 29)
-# Broadcast the EOD digest after the market has closed.
-EOD_AFTER = dtime(15, 35)
-
-
 def _parse_hhmm(s: str) -> dtime:
     hh, mm = s.split(":")
     return dtime(int(hh), int(mm))
@@ -86,6 +76,15 @@ def _parse_hhmm(s: str) -> dtime:
 _PREMARKET_T = PREMARKET_SCAN
 _OPEN_T = _parse_hhmm(MARKET_OPEN)
 _CLOSE_T = _parse_hhmm(MARKET_CLOSE)
+
+# EOD close-out schedule (configurable via .env; see config/settings.py):
+#   GEN_HALT_AFTER  — stop generating + cancel waiting calls (default 15:28)
+#   EOD_CLOSE_AFTER — square off all in-trade calls/positions (default 15:29)
+#   EOD_AFTER       — broadcast the EOD digest (default 15:35)
+# Halting before the square-off ensures nothing fresh can trigger and carry overnight.
+GEN_HALT_AFTER = _parse_hhmm(GEN_HALT_TIME)
+EOD_CLOSE_AFTER = _parse_hhmm(EOD_CLOSE_TIME)
+EOD_AFTER = _parse_hhmm(EOD_DIGEST_TIME)
 
 
 def _is_weekday(now: datetime) -> bool:
