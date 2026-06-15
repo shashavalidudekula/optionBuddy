@@ -53,6 +53,9 @@ def _corr(a, b):
     return cov / (va * vb) if va and vb else float("nan")
 
 
+_THROTTLE = 1.2  # seconds between Dhan /charts calls — the endpoint rate-limits bursts
+
+
 def fetch_intraday_window(session, underlying, total_days, chunk=60):
     """Fetch intraday 5-min over total_days, in <=chunk-day requests, deduped."""
     end = date.today()
@@ -68,8 +71,20 @@ def fetch_intraday_window(session, underlying, total_days, chunk=60):
                 seen.add(ts.isoformat())
                 bars.append(b)
         d = cend + timedelta(days=1)
+        time.sleep(_THROTTLE)
     bars.sort(key=lambda b: b["ts"])
     return bars
+
+
+def fetch_daily_retry(session, underlying, days, tries=4):
+    """Daily candles with backoff — survives the occasional 429 on /charts."""
+    for i in range(tries):
+        time.sleep(_THROTTLE)
+        bars = get_historical_daily(session, underlying, days=days)
+        if bars:
+            return bars
+        time.sleep(2.0 * (i + 1))
+    return []
 
 
 def main():
@@ -78,8 +93,10 @@ def main():
     session = _auth()
 
     intra = fetch_intraday_window(session, underlying, total_days)
-    daily = get_historical_daily(session, underlying, days=total_days + 10)
-    vix = get_historical_daily(session, "INDIAVIX", days=total_days + 10)
+    daily = fetch_daily_retry(session, underlying, days=total_days + 10)
+    vix = fetch_daily_retry(session, "INDIAVIX", days=total_days + 10)
+    if not vix:
+        print("(note: India VIX history unavailable — VIX-regime split will be empty)")
     if not intra:
         print("No intraday candles from Dhan — check the Data API subscription / range limits.")
         return
