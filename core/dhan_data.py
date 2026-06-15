@@ -546,20 +546,27 @@ def _parse_candles(resp) -> list[dict]:
     return out
 
 
-def get_historical_intraday(session, underlying: str, interval: str = "5", days: int = 30) -> list[dict]:
-    """Official Dhan intraday candles (interval in minutes: 1/5/15/25/60) for the
-    last `days`. Returns [{ts, open, high, low, close, volume}] oldest-first, or []."""
+def _date_str(d) -> str:
+    return d if isinstance(d, str) else d.isoformat()
+
+
+def get_historical_intraday(session, underlying: str, interval: str = "5", days: int = 30,
+                            from_date=None, to_date=None) -> list[dict]:
+    """Official Dhan intraday candles (interval in minutes: 1/5/15/25/60).
+
+    Defaults to the last `days`; pass explicit from_date/to_date (date or 'YYYY-MM-DD')
+    to fetch a window — Dhan caps the per-request range, so callers chunk long spans.
+    Returns [{ts, open, high, low, close, volume}] oldest-first, or []."""
     if session is None:
         return []
     tgt = _chart_target(underlying)
     if not tgt:
         return []
     sid, seg, instrument = tgt
-    today = date.today()
+    to_d = to_date or date.today()
+    from_d = from_date or (to_d - timedelta(days=days) if not isinstance(to_d, str) else None)
     body = {"securityId": sid, "exchangeSegment": seg, "instrument": instrument,
-            "interval": str(interval),
-            "fromDate": (today - timedelta(days=days)).isoformat(),
-            "toDate": today.isoformat()}
+            "interval": str(interval), "fromDate": _date_str(from_d), "toDate": _date_str(to_d)}
     try:
         return _parse_candles(session.post("/charts/intraday", json=body))
     except Exception as e:  # noqa: BLE001
@@ -567,19 +574,19 @@ def get_historical_intraday(session, underlying: str, interval: str = "5", days:
         return []
 
 
-def get_historical_daily(session, underlying: str, days: int = 120) -> list[dict]:
-    """Official Dhan daily candles for the last `days`. Oldest-first, or []."""
+def get_historical_daily(session, underlying: str, days: int = 120,
+                         from_date=None, to_date=None) -> list[dict]:
+    """Official Dhan daily candles. Defaults to last `days`; or pass from/to. Oldest-first."""
     if session is None:
         return []
     tgt = _chart_target(underlying)
     if not tgt:
         return []
     sid, seg, instrument = tgt
-    today = date.today()
+    to_d = to_date or date.today()
+    from_d = from_date or (to_d - timedelta(days=days) if not isinstance(to_d, str) else None)
     body = {"securityId": sid, "exchangeSegment": seg, "instrument": instrument,
-            "expiryCode": 0,
-            "fromDate": (today - timedelta(days=days)).isoformat(),
-            "toDate": today.isoformat()}
+            "expiryCode": 0, "fromDate": _date_str(from_d), "toDate": _date_str(to_d)}
     try:
         return _parse_candles(session.post("/charts/historical", json=body))
     except Exception as e:  # noqa: BLE001

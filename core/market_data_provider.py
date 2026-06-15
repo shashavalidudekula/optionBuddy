@@ -52,16 +52,17 @@ def get_option_chain(session, underlying, count: int = 4):
     return _impl.get_option_chain(session, underlying, count)
 
 
-def get_historical_intraday(session, underlying, interval: str = "5", days: int = 30):
+def get_historical_intraday(session, underlying, interval: str = "5", days: int = 30,
+                            from_date=None, to_date=None):
     """Official intraday candles (Dhan). [] if the provider lacks the endpoint."""
     fn = getattr(_impl, "get_historical_intraday", None)
-    return fn(session, underlying, interval, days) if fn else []
+    return fn(session, underlying, interval, days, from_date, to_date) if fn else []
 
 
-def get_historical_daily(session, underlying, days: int = 120):
+def get_historical_daily(session, underlying, days: int = 120, from_date=None, to_date=None):
     """Official daily candles (Dhan). [] if the provider lacks the endpoint."""
     fn = getattr(_impl, "get_historical_daily", None)
-    return fn(session, underlying, days) if fn else []
+    return fn(session, underlying, days, from_date, to_date) if fn else []
 
 
 def get_index_spots(session):

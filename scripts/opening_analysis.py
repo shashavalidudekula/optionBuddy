@@ -1,21 +1,21 @@
 """
 opening_analysis.py — Nifty opening dynamics on OFFICIAL Dhan candles.
 
-Pulls the last ~1 month of 5-min intraday + daily candles via the Dhan charts API
-and prints, day by day: prev close, open, gap, first-15-min volatility, how the day
-resolved, whether the opening direction persisted, and whether the day whipsawed
-(broke both sides of the opening range). Then aggregates the trends — the data
-behind "don't trade the open as an option buyer".
+Pulls intraday (5-min) + daily candles via the Dhan charts API over a window
+(default ~6 months, intraday fetched in chunks since Dhan caps per-request range)
+and reports the opening behaviour: gap, first-15-min volatility, how the day
+resolved, opening-direction persistence, whipsaw, the gap-fade tendency, plus
+splits by VIX regime and by month.
 
-Run on the server (where the Dhan session authenticates):
+Run on the server (or locally — prod creds are in .env):
     docker compose exec advisory-agent python scripts/opening_analysis.py
-Optional arg: underlying (default NIFTY), e.g. `... opening_analysis.py BANKNIFTY`.
+Args: [underlying] [days]   e.g.  `... opening_analysis.py NIFTY 190`
 """
 import os
 import sys
 import time
 from collections import defaultdict
-from datetime import time as dtime
+from datetime import date, time as dtime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,50 +30,77 @@ def _pct(a, b):
     return (a - b) / b * 100 if b else float("nan")
 
 
-def _auth(retries: int = 4):
-    """get_session() with retry — the TOTP auto-token can race the 30s window."""
+def _auth(retries: int = 5, wait: int = 40):
+    """get_session() with patient retry — Dhan's TOTP auto-token rate-limits rapid
+    repeats, so wait a full window+ between attempts (don't hammer it)."""
     for i in range(retries):
         try:
             return get_session()
         except Exception as e:  # noqa: BLE001
-            print(f"auth attempt {i+1}/{retries} failed ({str(e)[:60]}) — retrying…")
-            time.sleep(16)
+            print(f"auth attempt {i+1}/{retries} failed ({str(e)[:60]}) - waiting {wait}s...")
+            time.sleep(wait)
     raise SystemExit("Dhan auth failed after retries.")
+
+
+def _corr(a, b):
+    n = len(a)
+    if n < 2:
+        return float("nan")
+    ma, mb = sum(a) / n, sum(b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    va = sum((x - ma) ** 2 for x in a) ** 0.5
+    vb = sum((y - mb) ** 2 for y in b) ** 0.5
+    return cov / (va * vb) if va and vb else float("nan")
+
+
+def fetch_intraday_window(session, underlying, total_days, chunk=60):
+    """Fetch intraday 5-min over total_days, in <=chunk-day requests, deduped."""
+    end = date.today()
+    start = end - timedelta(days=total_days)
+    seen, bars = set(), []
+    d = start
+    while d <= end:
+        cend = min(d + timedelta(days=chunk), end)
+        part = get_historical_intraday(session, underlying, "5", from_date=d, to_date=cend)
+        for b in part:
+            ts = b.get("ts")
+            if ts and ts.isoformat() not in seen:
+                seen.add(ts.isoformat())
+                bars.append(b)
+        d = cend + timedelta(days=1)
+    bars.sort(key=lambda b: b["ts"])
+    return bars
 
 
 def main():
     underlying = (sys.argv[1] if len(sys.argv) > 1 else "NIFTY").upper()
+    total_days = int(sys.argv[2]) if len(sys.argv) > 2 else 190
     session = _auth()
 
-    intra = get_historical_intraday(session, underlying, interval="5", days=40)
-    daily = get_historical_daily(session, underlying, days=90)
-    vix = get_historical_daily(session, "INDIAVIX", days=90)
-
+    intra = fetch_intraday_window(session, underlying, total_days)
+    daily = get_historical_daily(session, underlying, days=total_days + 10)
+    vix = get_historical_daily(session, "INDIAVIX", days=total_days + 10)
     if not intra:
-        print("No intraday candles returned from Dhan. Check the Data API subscription "
-              "and that /charts/intraday is enabled for your account.")
+        print("No intraday candles from Dhan — check the Data API subscription / range limits.")
         return
-
-    # tz sanity — print the first/last bar so we can confirm the session window
-    print(f"Underlying: {underlying} | intraday bars: {len(intra)} | "
-          f"first {intra[0]['ts']} | last {intra[-1]['ts']}\n")
+    print(f"{underlying} | {len(intra)} intraday bars | {intra[0]['ts']} to {intra[-1]['ts']}\n")
 
     daily_close = sorted((b["ts"].date(), b["close"]) for b in daily if b.get("ts"))
     vix_close = sorted((b["ts"].date(), b["close"]) for b in vix if b.get("ts"))
 
-    def prev_close_for(d):
+    def prev_close_for(dd):
         prev = None
-        for dd, c in daily_close:
-            if dd < d:
+        for x, c in daily_close:
+            if x < dd:
                 prev = c
             else:
                 break
         return prev
 
-    def vix_for(d):
+    def vix_for(dd):
         val = None
-        for dd, c in vix_close:
-            if dd <= d:
+        for x, c in vix_close:
+            if x <= dd:
                 val = c
             else:
                 break
@@ -82,7 +109,7 @@ def main():
     by_day = defaultdict(list)
     for b in intra:
         ts = b.get("ts")
-        if ts and SESSION_OPEN <= ts.time() <= SESSION_CLOSE:  # drop after-hours/flat bars
+        if ts and SESSION_OPEN <= ts.time() <= SESSION_CLOSE:
             by_day[ts.date()].append(b)
 
     rows = []
@@ -91,54 +118,58 @@ def main():
         if len(g) < 4:
             continue
         o = g[0]["open"]
-        first15 = g[:3]
-        f_hi = max(b["high"] for b in first15)
-        f_lo = min(b["low"] for b in first15)
-        f_close = first15[-1]["close"]
+        f = g[:3]
+        f_hi, f_lo, f_close = max(b["high"] for b in f), min(b["low"] for b in f), f[-1]["close"]
         d_close = g[-1]["close"]
         rest = g[3:]
-        broke_up = any(b["high"] > f_hi for b in rest)
-        broke_dn = any(b["low"] < f_lo for b in rest)
-        prev_close = prev_close_for(day)
+        pc = prev_close_for(day)
         rows.append({
-            "date": str(day),
-            "gap": _pct(o, prev_close) if prev_close else float("nan"),
-            "or_pct": (f_hi - f_lo) / o * 100,
-            "f15": _pct(f_close, o),
-            "day": _pct(d_close, o),
+            "month": str(day)[:7], "gap": _pct(o, pc) if pc else float("nan"),
+            "or": (f_hi - f_lo) / o * 100, "f15": _pct(f_close, o), "day": _pct(d_close, o),
             "persist": (_pct(f_close, o) > 0) == (_pct(d_close, o) > 0),
-            "whipsaw": bool(broke_up and broke_dn),
+            "whip": any(b["high"] > f_hi for b in rest) and any(b["low"] < f_lo for b in rest),
             "vix": vix_for(day),
         })
-
-    if not rows:
-        print("Grouped candles but found no full sessions — check the bar timestamps above.")
-        return
-
-    hdr = f"{'date':<11}{'gap%':>7}{'open_rng%':>10}{'first15%':>10}{'day%':>8}{'persist':>9}{'whipsaw':>9}{'vix':>7}"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in rows:
-        v = f"{r['vix']:.1f}" if r["vix"] is not None else "  -"
-        print(f"{r['date']:<11}{r['gap']:>7.2f}{r['or_pct']:>10.2f}{r['f15']:>10.2f}"
-              f"{r['day']:>8.2f}{str(r['persist']):>9}{str(r['whipsaw']):>9}{v:>7}")
-
+    rows = [r for r in rows if r["gap"] == r["gap"]]  # drop days w/o prev close
     n = len(rows)
-    gaps = [abs(r["gap"]) for r in rows if r["gap"] == r["gap"]]
-    ors = [r["or_pct"] for r in rows]
-    persist = [r["persist"] for r in rows]
-    whips = [r["whipsaw"] for r in rows]
-    med_or = sorted(ors)[len(ors) // 2]
-    wide = [r["persist"] for r in rows if r["or_pct"] >= med_or]
-    narrow = [r["persist"] for r in rows if r["or_pct"] < med_or]
 
-    print(f"\n=== Aggregates over {n} sessions ===")
-    print(f"Avg |gap| vs prev close      : {sum(gaps)/len(gaps):.2f}%")
-    print(f"Avg first-15min range (vol)  : {sum(ors)/n:.2f}%   median {med_or:.2f}%   max {max(ors):.2f}%")
-    print(f"First-15 dir == day dir      : {100*sum(persist)/n:.0f}%   (fails {100*(1-sum(persist)/n):.0f}%)")
-    print(f"Whipsaw (broke BOTH sides)   : {100*sum(whips)/n:.0f}% of days")
-    if wide and narrow:
-        print(f"Persistence wide-open days   : {100*sum(wide)/len(wide):.0f}%  |  narrow-open: {100*sum(narrow)/len(narrow):.0f}%")
+    def rate(sub, key):
+        return 100 * sum(1 for r in sub if r[key]) / len(sub) if sub else 0.0
+
+    def faded(sub):
+        return 100 * sum(1 for r in sub if (r["gap"] > 0) != (r["f15"] > 0) and r["f15"] != 0) / len(sub) if sub else 0.0
+
+    print(f"=== OVERALL ({n} sessions) ===")
+    print(f"Avg |gap|: {sum(abs(r['gap']) for r in rows)/n:.2f}%  | avg first-15 range: {sum(r['or'] for r in rows)/n:.2f}%")
+    print(f"Persist (open dir = day dir): {rate(rows,'persist'):.0f}%   Whipsaw: {rate(rows,'whip'):.0f}%")
+    print(f"corr(gap, first15): {_corr([r['gap'] for r in rows],[r['f15'] for r in rows]):+.2f}   "
+          f"corr(gap, day): {_corr([r['gap'] for r in rows],[r['day'] for r in rows]):+.2f}")
+
+    print("\n=== GAP-FADE BUCKETS (does the open fade the gap?) ===")
+    print(f"{'bucket':<18}{'n':>4}{'faded@15%':>11}{'held-close%':>12}{'whipsaw%':>10}")
+    def show(lo, hi, label):
+        sub = [r for r in rows if lo <= r["gap"] < hi]
+        if not sub:
+            return
+        held = 100 * sum(1 for r in sub if (r["gap"] > 0) == (r["day"] > 0)) / len(sub)
+        print(f"{label:<18}{len(sub):>4}{faded(sub):>11.0f}{held:>12.0f}{rate(sub,'whip'):>10.0f}")
+    show(0.6, 9, "gap-up >0.6%"); show(0.3, 0.6, "gap-up 0.3-0.6%"); show(0.0, 0.3, "gap-up 0-0.3%")
+    show(-0.3, 0.0, "gap-dn 0-0.3%"); show(-0.6, -0.3, "gap-dn 0.3-0.6%"); show(-9, -0.6, "gap-dn >0.6%")
+
+    print("\n=== BY VIX REGIME ===")
+    print(f"{'regime':<14}{'n':>4}{'persist%':>10}{'whipsaw%':>10}{'gapfade%':>10}")
+    for label, lo, hi in [("low <14", 0, 14), ("mid 14-17", 14, 17), ("high >=17", 17, 99)]:
+        sub = [r for r in rows if r["vix"] is not None and lo <= r["vix"] < hi]
+        if sub:
+            print(f"{label:<14}{len(sub):>4}{rate(sub,'persist'):>10.0f}{rate(sub,'whip'):>10.0f}{faded(sub):>10.0f}")
+
+    print("\n=== BY MONTH ===")
+    print(f"{'month':<9}{'n':>4}{'avg|gap|':>10}{'persist%':>10}{'whipsaw%':>10}{'avgVIX':>8}")
+    for m in sorted({r["month"] for r in rows}):
+        sub = [r for r in rows if r["month"] == m]
+        vx = [r["vix"] for r in sub if r["vix"] is not None]
+        print(f"{m:<9}{len(sub):>4}{sum(abs(r['gap']) for r in sub)/len(sub):>10.2f}"
+              f"{rate(sub,'persist'):>10.0f}{rate(sub,'whip'):>10.0f}{(sum(vx)/len(vx) if vx else 0):>8.1f}")
 
 
 if __name__ == "__main__":
