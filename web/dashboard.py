@@ -302,7 +302,7 @@ function render(s){
     const b=new Date(a); b.setDate(b.getDate()+4);  // Mon → Fri
     const o={day:"2-digit",month:"short"};
     return a.toLocaleDateString("en-IN",o)+" – "+b.toLocaleDateString("en-IN",o); };
-  const PNL_HEAD = lbl => [{t:lbl,l:1},{t:"Trades"},{t:"Wins"},{t:"Losses"},{t:"Win %"},{t:"Profit"},{t:"Loss"},{t:"Net P&L"}];
+  const PNL_HEAD = lbl => [{t:lbl,l:1},{t:"Trades"},{t:"Wins"},{t:"Losses"},{t:"Win %"},{t:"Profit"},{t:"Loss"},{t:"Costs"},{t:"Net P&L"}];
   const pnlRow = (label, d) => `<tr>
       <td class="l">${label}</td>
       <td>${f0(d.trades)}</td>
@@ -311,6 +311,7 @@ function render(s){
       <td class="${d.win_rate>=50?'pos':'neg'}">${f(d.win_rate,1)}%</td>
       <td class="pos">${d.gross_profit>0?"+"+r0(d.gross_profit):"—"}</td>
       <td class="neg">${d.gross_loss<0?r0(d.gross_loss):"—"}</td>
+      <td class="dim">${d.costs>0?"−"+r0(d.costs):"—"}</td>
       <td class="${sgn(d.net_pnl)}">${d.net_pnl>=0?"+":""}${r0(d.net_pnl)}</td></tr>`;
 
   // Weekly P&L — resets each Monday with fresh capital; history kept for tracking.

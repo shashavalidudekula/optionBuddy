@@ -108,6 +108,10 @@ PAPER_MAX_LOTS          = int(os.getenv("PAPER_MAX_LOTS", "10"))
 PAPER_MAX_OPEN          = int(os.getenv("PAPER_MAX_OPEN", "0"))         # max concurrent positions (0 = unlimited; capital is the only limit)
 PAPER_DAILY_LOSS_PCT    = float(os.getenv("PAPER_DAILY_LOSS_PCT", "0.04"))  # halt new entries for the day
 PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # book this much at T1 (60%); hold 40% for T2
+# Flat all-in round-trip cost (brokerage + STT + exchange + GST + slippage proxy)
+# charged ONCE per position when it fully closes, so paper P&L reflects what you'd
+# actually net. Realistic intraday option strategies live or die on this number.
+PAPER_COST_PER_TRADE    = float(os.getenv("PAPER_COST_PER_TRADE", "100"))
 # Categories the paper trader will act on. Scope: long options + stocks only —
 # NO futures and NO short positions (those need a margin model; out of scope).
 PAPER_CATEGORIES        = tuple(
@@ -176,6 +180,21 @@ TAPE_EXIT_REVERSAL_PCT = float(os.getenv("TAPE_EXIT_REVERSAL_PCT", "0.50"))  # s
 # the move below T1, so the runner keeps most of the T1 profit instead of riding
 # all the way back to flat.
 T1_TRAIL_LOCK_FRACTION = float(os.getenv("T1_TRAIL_LOCK_FRACTION", "0.75"))
+
+# -- Profit protection (don't let a winning trade turn into a loss) ------------
+# Wide targets (e.g. BankNifty T1 ~100 pts) often see price run most of the way,
+# then reverse to SL — a winner becomes a full loss. These act BEFORE T1:
+#   1. Breakeven+ ratchet: once price covers PROFIT_LOCK_FRACTION of the entry→T1
+#      distance, trail the SL to lock PROFIT_TRAIL_KEEP of the favorable move
+#      (never below breakeven) — a trade in real profit can't close red.
+#   2. Time-in-profit partial: if price holds >= PROFIT_STALL_FRACTION of the way
+#      to T1 for PROFIT_STALL_MINUTES without reaching T1, book a partial and lock
+#      the SL — bank some, hold the rest.
+PROFIT_PROTECT_ENABLED = os.getenv("PROFIT_PROTECT_ENABLED", "true").lower() == "true"
+PROFIT_LOCK_FRACTION   = float(os.getenv("PROFIT_LOCK_FRACTION", "0.5"))   # frac of entry→T1 to start locking
+PROFIT_TRAIL_KEEP      = float(os.getenv("PROFIT_TRAIL_KEEP", "0.5"))      # frac of the favorable move locked into SL
+PROFIT_STALL_FRACTION  = float(os.getenv("PROFIT_STALL_FRACTION", "0.3"))  # min frac toward T1 to count as "in profit"
+PROFIT_STALL_MINUTES   = int(os.getenv("PROFIT_STALL_MINUTES", "10"))      # in profit this long but no T1 → book partial
 
 # -- Instruments (INDstocks security_ids) ------------------------------------
 TRACKED_INDICES    = os.getenv("TRACKED_INDICES", "13,25,1").split(",")      # Nifty50, BankNifty, VIX

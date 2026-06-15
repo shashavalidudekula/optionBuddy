@@ -83,37 +83,48 @@ def _week_start(date_str: str) -> str | None:
 def _aggregate(records: list[dict], key_fn) -> list[dict]:
     """Group records by key_fn(record) and roll up P&L stats per bucket.
 
-    Counts (wins/losses/trades) are per POSITION (rows sharing a position_id are
-    one trade); net P&L is the sum of every row. Legacy rows with no position_id
-    each count as their own position. Returns buckets newest-key first.
+    Rows sharing a position_id are one trade (a T1 partial + its final exit).
+    Per bucket we return a ledger that reconciles:
+        gross_profit + gross_loss - costs == net_pnl
+    where gross_profit/gross_loss split each position's GROSS P&L by sign, and
+    win/loss COUNTS use each position's NET P&L (after costs) — so a trade that
+    was gross-positive but eaten by costs correctly counts as a loss.
+    Legacy rows without position_id each count as their own trade.
     """
     buckets: dict[str, dict] = {}
     for i, r in enumerate(records):
         k = key_fn(r)
         if k is None:
             continue
-        b = buckets.setdefault(k, {"net": 0.0, "pos": {}})
-        pnl = float(r.get("pnl") or 0)
-        b["net"] += pnl
+        b = buckets.setdefault(k, {"costs": 0.0, "pos": {}})
+        b["costs"] += float(r.get("cost") or 0)
+        net = float(r.get("pnl") or 0)                      # NET of cost
+        gross = float(r.get("gross_pnl", r.get("pnl")) or 0)  # legacy: gross≈pnl
         pid = r.get("position_id")
-        gid = pid if pid is not None else f"_r{i}"  # legacy: one row = one trade
-        b["pos"][gid] = b["pos"].get(gid, 0.0) + pnl
+        gid = pid if pid is not None else f"_r{i}"
+        p = b["pos"].setdefault(gid, {"net": 0.0, "gross": 0.0})
+        p["net"] += net
+        p["gross"] += gross
 
     out: list[dict] = []
     for k in sorted(buckets, reverse=True):
-        pls = list(buckets[k]["pos"].values())
-        trades = len(pls)
-        wins = sum(1 for v in pls if v > 0)
-        losses = sum(1 for v in pls if v < 0)
+        positions = list(buckets[k]["pos"].values())
+        trades = len(positions)
+        wins = sum(1 for p in positions if p["net"] > 0)
+        losses = sum(1 for p in positions if p["net"] < 0)
+        gross_profit = sum(p["gross"] for p in positions if p["gross"] > 0)
+        gross_loss = sum(p["gross"] for p in positions if p["gross"] < 0)
+        net_pnl = sum(p["net"] for p in positions)
         out.append({
             "period": k,
             "trades": trades,
             "wins": wins,
             "losses": losses,
             "win_rate": round(100.0 * wins / trades, 1) if trades else 0.0,
-            "gross_profit": round(sum(v for v in pls if v > 0), 2),
-            "gross_loss": round(sum(v for v in pls if v < 0), 2),
-            "net_pnl": round(buckets[k]["net"], 2),
+            "gross_profit": round(gross_profit, 2),
+            "gross_loss": round(gross_loss, 2),
+            "costs": round(buckets[k]["costs"], 2),
+            "net_pnl": round(net_pnl, 2),
         })
     return out
 

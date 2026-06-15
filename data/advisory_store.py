@@ -157,6 +157,11 @@ def init_advisory_db() -> None:
         #   'executed' | 'unfunded' (no free capital) | 'capped' (max open) |
         #   'halted_daily_loss'. NULL = not a paper-scope call / not evaluated.
         cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS paper_status TEXT")
+        # Profit-protection bookkeeping: profit_since = when the call first held a
+        # meaningful unrealized profit (drives the time-in-profit partial);
+        # partial_booked = a profit partial has already been taken on this call.
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS profit_since TIMESTAMP")
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS partial_booked BOOLEAN DEFAULT FALSE")
         for idx in INDEXES:
             cur.execute(idx)
         conn.commit()
@@ -317,6 +322,32 @@ def update_call_status(
             params.append(datetime.now())
 
         params.append(call_id)
+        cur.execute(f"UPDATE calls SET {', '.join(fields)} WHERE id = %s", params)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+_KEEP = object()  # sentinel: "leave this column unchanged"
+
+
+def set_call_profit_state(call_id: int, profit_since=_KEEP, partial_booked=_KEEP) -> None:
+    """Persist profit-protection bookkeeping on a call (profit_since / partial_booked)."""
+    fields: list[str] = []
+    params: list = []
+    if profit_since is not _KEEP:
+        fields.append("profit_since = %s")
+        params.append(profit_since)
+    if partial_booked is not _KEEP:
+        fields.append("partial_booked = %s")
+        params.append(partial_booked)
+    if not fields:
+        return
+    params.append(call_id)
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
         cur.execute(f"UPDATE calls SET {', '.join(fields)} WHERE id = %s", params)
         conn.commit()
     finally:

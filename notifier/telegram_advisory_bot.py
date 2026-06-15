@@ -76,6 +76,7 @@ CATEGORY_LABEL = {
 EVENT_LABEL = {
     "entry_triggered": "📍 Entry triggered",
     "target1_hit": "🎯 Target 1 hit",
+    "time_partial": "⏱️ Profit stalled — booked partial & locked stop",
     "target_hit": "✅ Target hit — call closed",
     "sl_hit": "🛑 Stop-loss hit — call closed",
     "expired": "⌛ Call expired",

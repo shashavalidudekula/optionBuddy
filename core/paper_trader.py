@@ -28,6 +28,7 @@ from config.logger import get_logger
 from config.settings import (
     MIN_CONFIDENCE,
     PAPER_CATEGORIES,
+    PAPER_COST_PER_TRADE,
     PAPER_DAILY_LOSS_PCT,
     PAPER_MAX_LOTS,
     PAPER_MAX_OPEN,
@@ -103,6 +104,9 @@ class PaperTrader:
                     note = self._maybe_open(call, _f(evt.get("price")))
                 elif et == "target1_hit":
                     note = self._book_partial(call, _f(call.get("target_1")))
+                elif et == "time_partial":
+                    # Profit stalled below T1 — bank a partial at the current premium.
+                    note = self._book_partial(call, _f(evt.get("price")))
                 elif et == "target_hit":
                     note = self._close(call, _f(call.get("target_2")) or _f(call.get("target_1")), "exit")
                 elif et == "sl_hit":
@@ -289,14 +293,20 @@ class PaperTrader:
 
         action = str(pos["action"]).upper()
         entry = float(pos["entry_price"])
-        realized, cash_delta = _pnl_cash(action, entry, exit_price, remaining)
+        gross, cash_delta = _pnl_cash(action, entry, exit_price, remaining)
+        # Flat all-in round-trip cost is charged ONCE, here, on the final exit leg
+        # (partials booked earlier paid nothing). Net = gross − cost; the cash also
+        # leaves the account, so equity reflects the true take-home.
+        cost = round(PAPER_COST_PER_TRADE, 2)
+        realized = round(gross - cost, 2)
         book_paper_exit(
             position_id=pos["id"], call_id=pos["call_id"], instrument=pos["instrument"],
             exit_qty=remaining, exit_price=round(exit_price, 2),
-            realized_delta=realized, cash_delta=cash_delta, kind=kind, fully_closed=True,
+            realized_delta=realized, cash_delta=round(cash_delta - cost, 2),
+            kind=kind, fully_closed=True,
         )
-        log.info("PAPER CLOSE (%s) %s ×%s @ %.2f (pnl %.0f)", kind, pos["instrument"],
-                 remaining, exit_price, realized)
+        log.info("PAPER CLOSE (%s) %s ×%s @ %.2f (gross %.0f − cost %.0f = net %.0f)",
+                 kind, pos["instrument"], remaining, exit_price, gross, cost, realized)
         try:  # real-order hook (no-op in paper; double-guarded in live)
             self.broker.place_exit(
                 {"category": pos.get("category"), "underlying": pos.get("underlying"),
@@ -304,17 +314,21 @@ class PaperTrader:
                 action, remaining, exit_price, kind)
         except Exception as e:  # noqa: BLE001
             log.error("Broker place_exit (%s) failed (%s): %s", kind, pos["instrument"], e)
-        self._log_trade(pos, remaining, exit_price, realized, kind)
+        self._log_trade(pos, remaining, exit_price, realized, kind, cost=cost)
         label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY",
                  "invalidated": "🔄 PAPER CUT (trend reversed)",
                  "eod": "🌙 PAPER EOD square-off"}.get(kind, "PAPER CLOSE")
         emoji = "✅" if realized >= 0 else "❌"
         return (f"{label} <b>{pos['instrument']}</b> ×{remaining} @ ₹{exit_price:,.2f} "
-                f"{emoji} ₹{realized:,.0f}")
+                f"{emoji} ₹{realized:,.0f} <i>(after ₹{cost:,.0f} cost)</i>")
 
     @staticmethod
-    def _log_trade(pos: dict, qty, exit_price, realized, kind: str) -> None:
-        """Append a closed-trade record to the durable daily history."""
+    def _log_trade(pos: dict, qty, exit_price, realized, kind: str, cost: float = 0.0) -> None:
+        """Append a closed-trade record to the durable daily history.
+
+        `realized` is NET of `cost`; gross_pnl is stored alongside for transparency.
+        Partial legs pass cost=0 (the round-trip fee is charged on the final exit).
+        """
         now = datetime.now()
         append_history({
             "date": now.strftime("%Y-%m-%d"),
@@ -328,6 +342,8 @@ class PaperTrader:
             "qty": int(qty),
             "entry": float(pos.get("entry_price")),
             "exit": round(float(exit_price), 2),
+            "gross_pnl": round(float(realized) + float(cost), 2),
+            "cost": round(float(cost), 2),
             "pnl": realized,
             "kind": kind,
         })

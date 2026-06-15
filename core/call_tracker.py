@@ -18,8 +18,15 @@ from datetime import datetime, time as dtime
 from typing import Callable
 
 from config.logger import get_logger
-from config.settings import T1_TRAIL_LOCK_FRACTION
-from data.advisory_store import get_active_calls, update_call_status
+from config.settings import (
+    T1_TRAIL_LOCK_FRACTION,
+    PROFIT_PROTECT_ENABLED,
+    PROFIT_LOCK_FRACTION,
+    PROFIT_TRAIL_KEEP,
+    PROFIT_STALL_FRACTION,
+    PROFIT_STALL_MINUTES,
+)
+from data.advisory_store import get_active_calls, update_call_status, set_call_profit_state
 from core.tape_filter import is_invalidated, confirm_call
 
 log = get_logger("call_tracker")
@@ -270,6 +277,87 @@ def force_close_all_calls(price_lookup: PriceLookup | None = None,
     return events
 
 
+def _lock_stop(action: str, entry: float, profit: float) -> float:
+    """SL that locks PROFIT_TRAIL_KEEP of the favorable move (never worse than breakeven)."""
+    keep = min(max(PROFIT_TRAIL_KEEP, 0.0), 1.0)
+    if action == "BUY":
+        return round(entry + keep * profit, 2)
+    return round(entry - keep * profit, 2)
+
+
+def _raise_stop(call: dict, action: str, locked: float) -> bool:
+    """Move the call's SL to `locked` only if it tightens in the profitable direction."""
+    sl = _f(call.get("stop_loss"))
+    better = sl is None or (locked > sl if action == "BUY" else locked < sl)
+    if not better:
+        return False
+    update_call_status(call["id"], call["status"], stop_loss=locked)
+    call["stop_loss"] = locked  # keep the in-memory copy in sync for this pass
+    return True
+
+
+def _protect_profit(call: dict, price: float, now: datetime) -> list[dict]:
+    """Lock gains on an in-trade call BEFORE T1, so a winner can't reverse to a loss.
+
+    Only runs while status == 'entry_triggered' (pre-T1); after T1 the existing
+    t1-trail owns the stop. Two rules (see config PROFIT_*):
+      1. Breakeven+ ratchet once price covers PROFIT_LOCK_FRACTION of entry→T1.
+      2. Time-in-profit partial if it holds >= PROFIT_STALL_FRACTION of the way to
+         T1 for PROFIT_STALL_MINUTES without reaching T1.
+    SL trailing is silent (logged, shown on the dashboard); only the partial emits
+    an event. Returns the list of emitted events (0 or 1).
+    """
+    if not PROFIT_PROTECT_ENABLED or call.get("status") != "entry_triggered":
+        return []
+    action = str(call["action"]).upper()
+    entry, t1 = _f(call.get("entry_price")), _f(call.get("target_1"))
+    if entry is None or t1 is None:
+        return []
+    profit = (price - entry) if action == "BUY" else (entry - price)
+    dist = (t1 - entry) if action == "BUY" else (entry - t1)
+    if dist <= 0 or profit <= 0:
+        # Not in profit (or unusable levels) — reset the stall timer if it was running.
+        if call.get("profit_since") is not None:
+            set_call_profit_state(call["id"], profit_since=None)
+            call["profit_since"] = None
+        return []
+    frac = profit / dist
+    if frac >= 1.0:
+        return []  # at/through T1 — let the normal T1/T2 path handle it
+
+    events: list[dict] = []
+    cid = call["id"]
+
+    if frac < PROFIT_STALL_FRACTION:
+        if call.get("profit_since") is not None:
+            set_call_profit_state(cid, profit_since=None)
+            call["profit_since"] = None
+        return events
+
+    # In profit: start the stall timer if it isn't already running.
+    if call.get("profit_since") is None:
+        set_call_profit_state(cid, profit_since=now)
+        call["profit_since"] = now
+
+    # 1) Breakeven+ ratchet once we've covered enough of the way to T1.
+    if frac >= PROFIT_LOCK_FRACTION:
+        if _raise_stop(call, action, _lock_stop(action, entry, profit)):
+            log.info("Call #%s SL trailed to %.2f (%.0f%% to T1) — profit locked (%s)",
+                     cid, call["stop_loss"], frac * 100, call["instrument"])
+
+    # 2) Time-in-profit partial: stuck in profit too long without reaching T1.
+    ps = call.get("profit_since")
+    stalled = ps is not None and (now - ps).total_seconds() >= PROFIT_STALL_MINUTES * 60
+    if stalled and not call.get("partial_booked"):
+        _raise_stop(call, action, _lock_stop(action, entry, profit))  # lock before banking
+        set_call_profit_state(cid, partial_booked=True)
+        call["partial_booked"] = True
+        log.info("Call #%s profit stalled %s min @ %.2f (%.0f%% to T1) — booking partial (%s)",
+                 cid, PROFIT_STALL_MINUTES, price, frac * 100, call["instrument"])
+        events.append(_make_event(call, "time_partial", price, _pct(action, entry, price)))
+    return events
+
+
 def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
     """Run one tracking pass over all active calls.
 
@@ -323,6 +411,13 @@ def track_active_calls(price_lookup: PriceLookup) -> list[dict]:
                 "call": call,
             })
             continue
+
+        # Lock in profit before T1 (breakeven+ trail; time-in-profit partial).
+        # Runs first so _evaluate_call below sees any tightened stop this pass.
+        try:
+            events.extend(_protect_profit(call, float(price), now))
+        except Exception as e:  # noqa: BLE001
+            log.debug("Profit-protect failed for call #%s: %s", call["id"], e)
 
         evt = _evaluate_call(call, float(price))
         if evt:
