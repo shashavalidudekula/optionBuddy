@@ -117,6 +117,10 @@ PAPER_COST_PER_TRADE    = float(os.getenv("PAPER_COST_PER_TRADE", "100"))
 # SMALLER of PAPER_RISK_PCT×equity and this absolute rupee cap; if even one lot
 # would exceed it, the trade is skipped (logged/flagged 'risk_skip').
 PAPER_MAX_LOSS_PER_TRADE = float(os.getenv("PAPER_MAX_LOSS_PER_TRADE", "2000"))
+# Master switch for the per-trade risk cap above. false → don't cap/skip on risk;
+# size by PAPER_RISK_PCT (floored at PAPER_MIN_LOTS). A single SL can then lose
+# more than PAPER_MAX_LOSS_PER_TRADE, but fewer trades get skipped.
+PAPER_RISK_CAP_ENABLED  = os.getenv("PAPER_RISK_CAP_ENABLED", "true").lower() == "true"
 # Categories the paper trader will act on. Scope: long options + stocks only —
 # NO futures and NO short positions (those need a margin model; out of scope).
 PAPER_CATEGORIES        = tuple(

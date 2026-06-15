@@ -31,6 +31,7 @@ from config.settings import (
     PAPER_COST_PER_TRADE,
     PAPER_DAILY_LOSS_PCT,
     PAPER_MAX_LOSS_PER_TRADE,
+    PAPER_RISK_CAP_ENABLED,
     PAPER_MAX_LOTS,
     PAPER_MAX_OPEN,
     PAPER_MIN_LOTS,
@@ -172,24 +173,30 @@ class PaperTrader:
             log.info("Paper skip (no lot size for %s): %s", underlying, call.get("instrument"))
             return None
 
-        # Position size: risk the SMALLER of PAPER_RISK_PCT×equity and the absolute
-        # per-trade rupee cap to the stop. A single SL can therefore never lose more
-        # than that cap — a pricey premium with a wide stop simply takes fewer lots
-        # (or is skipped), so one trade can't blow the day's loss budget.
+        # Position size. With the per-trade risk cap ON (default), risk the SMALLER
+        # of PAPER_RISK_PCT×equity and the absolute rupee cap to the stop — so a
+        # single SL can never lose more than that cap; if even one lot would breach
+        # it, the trade is skipped. With the cap OFF, size by PAPER_RISK_PCT alone
+        # (floored at PAPER_MIN_LOTS) and never skip for risk.
         equity = compute_paper_equity()
-        risk_cap = min(PAPER_RISK_PCT * equity, PAPER_MAX_LOSS_PER_TRADE)
         one_lot_risk = per_unit_risk * lot_size
-        risk_lots = math.floor(risk_cap / one_lot_risk) if one_lot_risk > 0 else 0
-        if risk_lots < 1:
-            # Even a single lot would risk more than the cap (wide SL on a pricey
-            # premium) — skip the trade rather than breach the per-trade limit.
-            log.info("Paper NOT EXECUTED (1 lot risks ₹%.0f > cap ₹%.0f): %s",
-                     one_lot_risk, risk_cap, call.get("instrument"))
-            set_call_paper_status(call_id, "risk_skip")
-            return (f"⛔ <b>Not executed</b> · {call.get('instrument')}\n"
-                    f"1 lot risks ₹{one_lot_risk:,.0f} (SL {per_unit_risk:,.0f} × {lot_size}) "
-                    f"&gt; per-trade cap ₹{risk_cap:,.0f} — skipped to protect the daily limit.")
-        lots = risk_lots
+        if PAPER_RISK_CAP_ENABLED:
+            risk_cap = min(PAPER_RISK_PCT * equity, PAPER_MAX_LOSS_PER_TRADE)
+            risk_lots = math.floor(risk_cap / one_lot_risk) if one_lot_risk > 0 else 0
+            if risk_lots < 1:
+                # Even a single lot would risk more than the cap (wide SL on a pricey
+                # premium) — skip rather than breach the per-trade limit.
+                log.info("Paper NOT EXECUTED (1 lot risks ₹%.0f > cap ₹%.0f): %s",
+                         one_lot_risk, risk_cap, call.get("instrument"))
+                set_call_paper_status(call_id, "risk_skip")
+                return (f"⛔ <b>Not executed</b> · {call.get('instrument')}\n"
+                        f"1 lot risks ₹{one_lot_risk:,.0f} (SL {per_unit_risk:,.0f} × {lot_size}) "
+                        f"&gt; per-trade cap ₹{risk_cap:,.0f} — skipped to protect the daily limit.")
+            lots = risk_lots
+        else:
+            # Cap off: size by risk-% but floor at the minimum so trades still fire.
+            risk_lots = math.floor(PAPER_RISK_PCT * equity / one_lot_risk) if one_lot_risk > 0 else 0
+            lots = max(PAPER_MIN_LOTS, risk_lots)
         # Ceiling: cheap near-expiry premiums make per-unit risk tiny, so risk
         # sizing alone balloons into 20-300 lots of lottery tickets.
         if PAPER_MAX_LOTS > 0:
