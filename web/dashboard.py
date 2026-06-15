@@ -240,16 +240,25 @@ const entryLtp = c => {
 };
 const targets = c => [c.target_1,c.target_2].filter(x=>x!=null).map(r2).join(" · ")||"—";
 
+let NOW=null;  // server "now" (set each render) — drives the stage timers
+const _ms = v => v?Date.parse(String(v).replace(" ","T")):NaN;
+const since = iso => { const d=_ms(NOW)-_ms(iso); return (isNaN(d)||d<0)?null:d; };
+const human = ms => { if(ms==null) return "—"; const m=Math.round(ms/60000);
+  return m<60?m+"m":Math.floor(m/60)+"h"+(m%60?" "+(m%60)+"m":""); };
+const stageAge = c => c.status==='target1_hit' ? 'T1 trail '+human(since(c.target1_hit_at||c.entry_triggered_at||c.issued_at))
+  : c.status==='entry_triggered' ? 'in trade '+human(since(c.entry_triggered_at||c.issued_at))
+  : 'waiting '+human(since(c.issued_at));
+
 function tbl(head, rows){
   if(!rows.length) return '<div class="empty">— none —</div>';
   return '<table><thead><tr>'+head.map(h=>`<th class="${h.l?'l':''}">${h.t}</th>`).join('')+
     '</tr></thead><tbody>'+rows.join('')+'</tbody></table>';
 }
-const CALL_HEAD = [{t:"Instrument",l:1},{t:"Status"},{t:"Entry / LTP",l:1},{t:"Targets"},{t:"Stop"}];
+const CALL_HEAD = [{t:"# / Instrument",l:1},{t:"Stage · age"},{t:"Entry / LTP",l:1},{t:"Targets"},{t:"Stop"}];
 function callRow(c){
   return `<tr>
-    <td class="l">${side(c.action)} ${xp(c.option_expiry)}${esc(c.instrument)}</td>
-    <td><span class="pill">${STAT[c.status]||c.status}</span></td>
+    <td class="l"><span class="dim">#${c.id}</span> ${side(c.action)} ${xp(c.option_expiry)}${esc(c.instrument)}</td>
+    <td><span class="pill">${stageAge(c)}</span></td>
     <td class="l">${entryLtp(c)}</td>
     <td>${targets(c)}</td>
     <td>${c.stop_loss!=null?r2(c.stop_loss):"—"}</td></tr>`;
@@ -277,6 +286,7 @@ function capBox(title, tag, count, inner, cls, foot){
 }
 
 function render(s){
+  NOW = s.now;
   const st = s.paper.stats || {};
   document.getElementById('updated').innerHTML = '<span class="dot">●</span> live · updated ' + (s.now||"").replace("T"," ") + ' IST';
   const ret = st.total_return_pct;
@@ -331,9 +341,9 @@ function render(s){
   // Open positions
   const op = s.paper.open;
   const opTbl = op.length ? tbl(
-    [{t:"Instrument",l:1},{t:"Status"},{t:"Entry / LTP",l:1},{t:"Targets"},{t:"Stop"},{t:"uP&L"}],
-    op.map(p=>`<tr><td class="l">${side(p.action)} ${xp(p.option_expiry)}${esc(p.instrument)}</td>
-      <td><span class="pill">in trade</span></td><td class="l">${entryLtp(p)}</td>
+    [{t:"# / Instrument",l:1},{t:"Held",l:1},{t:"Entry / LTP",l:1},{t:"Targets"},{t:"Stop"},{t:"uP&L"}],
+    op.map(p=>`<tr><td class="l"><span class="dim">#${p.call_id}</span> ${side(p.action)} ${xp(p.option_expiry)}${esc(p.instrument)}</td>
+      <td class="l"><span class="pill">in trade ${human(since(p.opened_at))}</span></td><td class="l">${entryLtp(p)}</td>
       <td>${targets(p)}</td><td>${p.stop_loss!=null?r2(p.stop_loss):"—"}</td>
       <td class="${sgn(p.unrealized_pnl)}">${p.unrealized_pnl>=0?"+":""}${r0(p.unrealized_pnl)}</td></tr>`))
     : '<div class="empty">No open positions — engine is flat.</div>';

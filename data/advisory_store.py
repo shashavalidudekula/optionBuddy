@@ -167,6 +167,9 @@ def init_advisory_db() -> None:
         # partial_booked = a profit partial has already been taken on this call.
         cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS profit_since TIMESTAMP")
         cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS partial_booked BOOLEAN DEFAULT FALSE")
+        # Stage timestamps — drive the "time in stage" display (waiting / in-trade / T1 trail).
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS entry_triggered_at TIMESTAMP")
+        cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS target1_hit_at TIMESTAMP")
         for idx in INDEXES:
             cur.execute(idx)
         conn.commit()
@@ -268,6 +271,22 @@ def get_closed_calls(limit: int = 50) -> list[dict]:
         conn.close()
 
 
+def get_call(call_id: int) -> dict | None:
+    """Fetch a single call by id (any status), or None."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM calls WHERE id = %s", (call_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        cur.close()
+        conn.close()
+
+
 def get_recent_calls(limit: int = 20, category: str | None = None) -> list[dict]:
     """Fetch recent calls, optionally filtered by category."""
     conn = get_conn()
@@ -319,6 +338,10 @@ def update_call_status(
         if entry_triggered is not None:
             fields.append("entry_triggered = %s")
             params.append(entry_triggered)
+            if entry_triggered:  # stamp the entry time once (drives the in-trade timer)
+                fields.append("entry_triggered_at = COALESCE(entry_triggered_at, NOW())")
+        if status == "target1_hit":  # stamp the T1-trail start once
+            fields.append("target1_hit_at = COALESCE(target1_hit_at, NOW())")
         if stop_loss is not None:
             fields.append("stop_loss = %s")
             params.append(stop_loss)

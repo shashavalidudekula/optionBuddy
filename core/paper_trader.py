@@ -338,7 +338,8 @@ class PaperTrader:
         self._log_trade(pos, remaining, exit_price, realized, kind, cost=cost)
         label = {"exit": "🎯 PAPER TARGET", "stop": "🛑 PAPER STOP", "expiry": "⌛ PAPER EXPIRY",
                  "invalidated": "🔄 PAPER CUT (trend reversed)",
-                 "eod": "🌙 PAPER EOD square-off"}.get(kind, "PAPER CLOSE")
+                 "eod": "🌙 PAPER EOD square-off",
+                 "manual": "🙋 PAPER MANUAL CLOSE"}.get(kind, "PAPER CLOSE")
         emoji = "✅" if realized >= 0 else "❌"
         return (f"{label} <b>{pos['instrument']}</b> ×{remaining} @ ₹{exit_price:,.2f} "
                 f"{emoji} ₹{realized:,.0f} <i>(after ₹{cost:,.0f} cost)</i>")
@@ -409,6 +410,15 @@ class PaperTrader:
                 log.info("PAPER EXPIRY SETTLE %s (expiry %s) @ %.2f", pos.get("instrument"), exp, float(price))
                 notes.append(note)
         return notes
+
+    # ── manual close ─────────────────────────────────────────────────────────────
+
+    def manual_close(self, call_id: int, price: float | None) -> str | None:
+        """Close the open paper position for a call at `price` (Telegram /exit).
+
+        No-op (returns None) if the call has no open paper position.
+        """
+        return self._close({"id": call_id}, _f(price), "manual")
 
     # ── EOD square-off ───────────────────────────────────────────────────────────
 

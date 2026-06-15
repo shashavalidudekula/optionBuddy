@@ -623,6 +623,76 @@ def build_calls_report(category: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# ── /exit & /sl — manual trade management (owner only) ─────────────────────────
+
+def do_exit_call(call_id: int) -> str:
+    """Close a call at the current premium (closes its paper position too)."""
+    from data.advisory_store import get_call, update_call_status
+
+    call = get_call(call_id)
+    if not call:
+        return f"ℹ️ No call <b>#{call_id}</b> found."
+    if call.get("status") in ("target_hit", "sl_hit", "expired", "closed"):
+        return f"ℹ️ Call <b>#{call_id}</b> ({html.escape(str(call.get('instrument')))}) is already closed."
+
+    session = None
+    price = None
+    try:
+        from core.market_data_provider import get_session, make_price_lookup, warm_instruments
+        session = get_session()
+        warm_instruments(session)
+        price = make_price_lookup(session)(call)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Exit price lookup failed for #%s: %s", call_id, e)
+    if price is None:
+        price = call.get("last_price")  # fall back to the last tracked price
+    if price is None:
+        return (f"⚠️ Couldn't get a price for <b>#{call_id}</b> "
+                f"({html.escape(str(call.get('instrument')))}) and none on record. Try again.")
+    price = float(price)
+
+    paper_note = None
+    try:
+        from core.paper_trader import PaperTrader
+        paper_note = PaperTrader(session).manual_close(call_id, price)
+    except Exception as e:  # noqa: BLE001
+        log.error("Manual paper close failed for #%s: %s", call_id, e)
+
+    action = str(call.get("action", "")).upper()
+    entry = float(call.get("entry_price") or 0)
+    result = None
+    if entry:
+        result = round((price - entry) / entry * 100, 2) if action == "BUY" \
+            else round((entry - price) / entry * 100, 2)
+    update_call_status(call_id, "closed", last_price=price, result_pct=result)
+    log.info("Manual /exit closed call #%s (%s) @ %.2f", call_id, call.get("instrument"), price)
+
+    out = [f"🙋 <b>Closed #{call_id}</b> — {action} "
+           f"{html.escape(str(call.get('instrument')))} @ ₹{price:,.2f}"]
+    if result is not None:
+        out.append(f"Result: {'🟢 +' if result >= 0 else '🔴 '}{result:.2f}%")
+    if paper_note:
+        out.append(paper_note)
+    return "\n".join(out)
+
+
+def do_set_sl(call_id: int, new_sl: float) -> str:
+    """Adjust a live call's stop-loss to `new_sl` (Telegram /sl)."""
+    from data.advisory_store import get_call, update_call_status
+
+    call = get_call(call_id)
+    if not call:
+        return f"ℹ️ No call <b>#{call_id}</b> found."
+    if call.get("status") in ("target_hit", "sl_hit", "expired", "closed"):
+        return f"ℹ️ Call <b>#{call_id}</b> is closed — can't adjust its stop."
+    old = call.get("stop_loss")
+    update_call_status(call_id, str(call.get("status") or "active"), stop_loss=float(new_sl))
+    log.info("Manual /sl set call #%s SL %.2f → %.2f", call_id, float(old or 0), float(new_sl))
+    return (f"🛑 <b>Stop-loss updated</b> — #{call_id} "
+            f"{html.escape(str(call.get('instrument')))}\n"
+            f"{_fmt_price(old)} → <b>₹{float(new_sl):,.2f}</b>")
+
+
 class TelegramAdvisoryBot:
     """Advisory-only Telegram bot with subscriber management and call push."""
 
@@ -640,6 +710,8 @@ class TelegramAdvisoryBot:
         self.app.add_handler(CommandHandler("review", self._cmd_review))
         self.app.add_handler(CommandHandler("paper", self._cmd_paper))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("exit", self._cmd_exit))
+        self.app.add_handler(CommandHandler("sl", self._cmd_sl))
         self.app.add_handler(CommandHandler("why", self._cmd_why))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CallbackQueryHandler(self._on_category_toggle, pattern=r"^cat:"))
@@ -795,6 +867,42 @@ class TelegramAdvisoryBot:
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    async def _cmd_exit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Manually close a call at the current price (owner only): /exit <call_id>."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /exit is restricted to the account owner.")
+            return
+        arg = (ctx.args[0] if getattr(ctx, "args", None) else "").lstrip("#").strip()
+        if not arg.isdigit():
+            await update.message.reply_text(
+                "Use <code>/exit &lt;call_id&gt;</code> — e.g. <code>/exit 469</code>. "
+                "Find the id (#) on the dashboard or in /calls.", parse_mode="HTML")
+            return
+        await update.message.reply_text("⏳ Closing…")
+        report = await asyncio.to_thread(do_exit_call, int(arg))
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    async def _cmd_sl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Adjust a call's stop-loss (owner only): /sl <call_id> <price>."""
+        if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("🔒 /sl is restricted to the account owner.")
+            return
+        args = getattr(ctx, "args", None) or []
+        cid = args[0].lstrip("#").strip() if len(args) >= 1 else ""
+        if len(args) < 2 or not cid.isdigit():
+            await update.message.reply_text(
+                "Use <code>/sl &lt;call_id&gt; &lt;price&gt;</code> — e.g. <code>/sl 469 430</code>.",
+                parse_mode="HTML")
+            return
+        try:
+            new_sl = float(args[1])
+        except ValueError:
+            await update.message.reply_text("Price must be a number — e.g. <code>/sl 469 430</code>.",
+                                            parse_mode="HTML")
+            return
+        report = await asyncio.to_thread(do_set_sl, int(cid), new_sl)
+        await update.message.reply_text(report, parse_mode="HTML")
+
     async def _cmd_why(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Explain a published call: the model's rationale + the inputs it saw (owner only)."""
         if TELEGRAM_CHAT_ID and str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
@@ -869,6 +977,8 @@ class TelegramAdvisoryBot:
             "    ↳ /paper YYYY/MM/DD — that date's results\n"
             "• /status — active LLM, data feed & mode + scan cadence (owner only)\n"
             "• /why &lt;id&gt; — why a call was taken + the inputs it saw (owner only)\n"
+            "• /exit &lt;id&gt; — close a call now at the current price (owner only)\n"
+            "• /sl &lt;id&gt; &lt;price&gt; — adjust a call's stop-loss (owner only)\n"
             "• /stop — pause  •  /start — resume\n\n"
             + DISCLAIMER,
             parse_mode="Markdown",
