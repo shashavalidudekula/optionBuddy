@@ -89,7 +89,6 @@ NEWS_API_KEY       = os.getenv("NEWS_API_KEY", "")
 
 # -- Risk controls ------------------------------------------------------------
 MAX_LOSS_PER_TRADE = int(os.getenv("MAX_LOSS_PER_TRADE", "2000"))
-DAILY_LOSS_LIMIT   = int(os.getenv("DAILY_LOSS_LIMIT", "5000"))
 MAX_LOTS_PER_ORDER = int(os.getenv("MAX_LOTS_PER_ORDER", "2"))
 AUTO_EXECUTE       = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
 MIN_CONFIDENCE     = int(os.getenv("MIN_CONFIDENCE", "75"))

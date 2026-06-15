@@ -148,12 +148,14 @@ class PaperTrader:
             set_call_paper_status(call_id, "capped")
             return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
                     f"Max {PAPER_MAX_OPEN} positions open — capital tied up. Call still logged.")
-        loss_limit = -PAPER_DAILY_LOSS_PCT * PAPER_START_CAPITAL
-        if get_paper_today_realized() <= loss_limit:
-            log.info("Paper NOT EXECUTED (daily loss limit): %s", call.get("instrument"))
-            set_call_paper_status(call_id, "halted_daily_loss")
-            return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
-                    f"Daily loss limit ₹{abs(loss_limit):,.0f} hit — execution halted today.")
+        # Daily-loss halt (disabled when PAPER_DAILY_LOSS_PCT <= 0).
+        if PAPER_DAILY_LOSS_PCT > 0:
+            loss_limit = -PAPER_DAILY_LOSS_PCT * PAPER_START_CAPITAL
+            if get_paper_today_realized() <= loss_limit:
+                log.info("Paper NOT EXECUTED (daily loss limit): %s", call.get("instrument"))
+                set_call_paper_status(call_id, "halted_daily_loss")
+                return (f"⏸️ <b>Not executed</b> · {call.get('instrument')}\n"
+                        f"Daily loss limit ₹{abs(loss_limit):,.0f} hit — execution halted today.")
         if int(call.get("confidence") or 0) < MIN_CONFIDENCE:
             return None
 
