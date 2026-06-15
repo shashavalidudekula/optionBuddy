@@ -66,6 +66,10 @@ services:
       DB_PASSWORD: trading_password
       PYTHONUNBUFFERED: 1
       TZ: Asia/Kolkata
+    volumes:
+      # Read the durable paper-history ledger the engine writes, so the
+      # Daily/Weekly P&L tables can see every closed trade (incl. manual /exit).
+      - ./logs:/app/logs:ro
     ports:
       - "8000:8000"
     networks:
