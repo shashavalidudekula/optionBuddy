@@ -211,7 +211,7 @@ SCALP_STOP_PCT        = float(os.getenv("SCALP_STOP_PCT", "0"))        # premium
 # Generate synthetic short-volatility calls daily (one per underlying). Spreads
 # limit max loss; naked shorts have unlimited loss but higher credit. Both routes
 # to their own paper books, margin-constrained, with realistic slippage on exits.
-SELLING_ENABLED       = os.getenv("SELLING_ENABLED", "false").lower() == "true"
+SELLING_ENABLED       = os.getenv("SELLING_ENABLED", "true").lower() == "true"  # default ON (paper)
 SELLING_UNDERLYINGS   = tuple(
     u.strip() for u in os.getenv("SELLING_UNDERLYINGS", "NIFTY,BANKNIFTY").split(",") if u.strip()
 )
@@ -226,7 +226,7 @@ SELLING_HOLD_DAYS     = int(os.getenv("SELLING_HOLD_DAYS", "7"))          # hard
 # Best evidence-based retail play in India: low-turnover momentum rank + quality
 # filter on large-cap equities (NIFTY50 / NIFTYNXT50 or custom universe). Monthly
 # rebalance; ~5 concurrent longs. No LLM, no prediction — pure factor exposure.
-EQUITY_FACTOR_ENABLED = os.getenv("EQUITY_FACTOR_ENABLED", "false").lower() == "true"
+EQUITY_FACTOR_ENABLED = os.getenv("EQUITY_FACTOR_ENABLED", "true").lower() == "true"  # default ON (paper)
 EQUITY_FACTOR_UNIVERSE = tuple(
     u.strip() for u in os.getenv("EQUITY_FACTOR_UNIVERSE", "TCS,INFY,WIPRO,MARUTI,BAJAJFINSV").split(",") if u.strip()
 )
@@ -238,7 +238,7 @@ EQUITY_FACTOR_MAX_VOL_PERCENTILE = float(os.getenv("EQUITY_FACTOR_MAX_VOL_PERCEN
 # ATM calls on high-volume liquid stocks. ILLIQUIDITY WARNING: Indian stock option
 # spreads are brutal; many don't trade; fills are optimistic. Use only to measure
 # and validate against live Dhan data before deploying capital. Buying ONLY.
-STOCK_OPT_ENABLED = os.getenv("STOCK_OPT_ENABLED", "false").lower() == "true"
+STOCK_OPT_ENABLED = os.getenv("STOCK_OPT_ENABLED", "true").lower() == "true"  # default ON (paper)
 STOCK_OPT_UNDERLYINGS = tuple(
     u.strip() for u in os.getenv("STOCK_OPT_UNDERLYINGS", "TCS,INFY,WIPRO").split(",") if u.strip()
 )

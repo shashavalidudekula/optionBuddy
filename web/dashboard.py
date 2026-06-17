@@ -218,42 +218,49 @@ _PAGE = """<!doctype html>
     --sans:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
   }
   *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:13px;line-height:1.35}
-  header{display:flex;align-items:center;gap:14px;padding:9px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  html,body{height:100%;max-width:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:13px;line-height:1.35;overflow-x:hidden}
+  header{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;padding:9px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
   header .logo{font-weight:600;letter-spacing:.3px}
   header .logo b{color:var(--grn)}
   header .live{color:var(--mut);font-family:var(--mono);font-size:11px}
   header .live .dot{color:var(--grn)}
   header .right{margin-left:auto;color:var(--dim);font-family:var(--mono);font-size:11px;letter-spacing:.3px}
-  main{padding:12px 16px}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:8px;margin-bottom:12px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 11px}
+  main{padding:12px 16px;max-width:100%}
+  main > .box{margin-bottom:12px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:8px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 11px;min-width:0}
   .card .k{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.7px}
   .card .v{font-family:var(--mono);font-size:18px;font-weight:600;margin-top:3px}
   .card .sub{font-family:var(--mono);font-size:11px;margin-top:2px}
-  #open{margin-bottom:12px}
+  /* Top-level book tabs + the per-book content stack (even spacing between tables). */
+  #bookTabs{flex-wrap:wrap;margin-bottom:12px;border-bottom:0;padding:0}
+  #bookContent{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
   @media(max-width:768px){.row{grid-template-columns:1fr}}
-  .box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+  .box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;min-height:0;min-width:0}
   .box.tall{height:60vh}
   .box.short{max-height:40vh}
   .cap{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);flex:0 0 auto}
   .cap .t{font-size:12px;font-weight:600;letter-spacing:.4px}
   .cap .tag{font-family:var(--mono);font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 6px;text-transform:uppercase;letter-spacing:.5px}
   .cap .n{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--mut)}
-  .tabs{display:flex;gap:5px;padding:7px 9px;border-bottom:1px solid var(--line);flex:0 0 auto}
+  .tabs{display:flex;flex-wrap:wrap;gap:5px;padding:7px 9px;border-bottom:1px solid var(--line);flex:0 0 auto}
   .tab{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:6px;padding:4px 12px;font-family:var(--mono);font-size:11.5px;cursor:pointer;display:flex;gap:7px;align-items:center}
   .tab:hover{color:var(--fg)}
   .tab.active{background:#202a3a;color:var(--fg);border-color:#3a4860}
   .tab .b{color:var(--dim);font-size:10px}
   .tab.active .b{color:var(--accent)}
-  .bd{overflow:auto;min-height:0}
+  /* min-width:0 lets the wide tables scroll INSIDE their card instead of pushing
+     the whole page wide (the flexbox min-content overflow trap on mobile). */
+  .bd{overflow:auto;min-height:0;min-width:0;-webkit-overflow-scrolling:touch}
   .box.tall .panel{flex:1 1 auto}
-  .panel{overflow:auto;min-height:0}
+  .panel{overflow:auto;min-height:0;min-width:0;-webkit-overflow-scrolling:touch}
   table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
-  th,td{text-align:right;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th,td{text-align:right;padding:7px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
   th:first-child,td:first-child,.l{text-align:left}
+  th:last-child,td:last-child{padding-right:14px}
+  th:first-child,td:first-child{padding-left:14px}
   th{position:sticky;top:0;background:var(--panel2);color:var(--dim);font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.5px;z-index:1}
   tbody tr:hover{background:#1c2433}
   .pos{color:var(--grn)} .neg{color:var(--red)}
@@ -264,6 +271,26 @@ _PAGE = """<!doctype html>
   .foot{padding:6px 12px;font-family:var(--mono);font-size:10.5px;color:var(--dim);border-top:1px solid var(--line)}
   .empty{color:var(--dim);padding:16px 12px;font-family:var(--mono);font-size:12px}
   footer{color:var(--dim);font-size:11px;padding:10px 16px;border-top:1px solid var(--line)}
+  /* Mobile: tighter spacing, smaller type, and let tables grow (page scrolls
+     vertically) while each table still scrolls horizontally inside its own card. */
+  @media(max-width:600px){
+    main{padding:8px 10px}
+    main > .box{margin-bottom:10px}
+    header{padding:8px 10px;gap:3px 10px}
+    header .right{display:none}
+    #bookContent{gap:10px}
+    .row{gap:10px;margin-bottom:10px}
+    .cards{grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:6px}
+    .card{padding:7px 9px}
+    .card .v{font-size:15px}
+    .card .k{font-size:9px}
+    th,td{padding:6px 10px;font-size:11px}
+    th:first-child,td:first-child,th:last-child,td:last-child{padding-left:10px;padding-right:10px}
+    .cap{padding:7px 10px}
+    .cap .t{font-size:11px}
+    .box.short{max-height:none}
+    .box.tall{height:auto;max-height:72vh}
+  }
 </style>
 </head>
 <body>
@@ -279,10 +306,7 @@ _PAGE = """<!doctype html>
     <div id="col-opt"></div>
     <div id="col-oth"></div>
   </div>
-  <div class="row">
-    <div id="ledger"></div>
-    <div id="closed"></div>
-  </div>
+  <div id="closed"></div>
   <div id="notexec"></div>
 </main>
 <footer>Read-only mirror · advisory only, not investment advice · markets carry risk.</footer>
