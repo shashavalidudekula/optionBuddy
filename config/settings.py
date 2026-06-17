@@ -145,11 +145,12 @@ PAPER_CATEGORIES        = tuple(
 # One-time destructive reset of the paper account on startup (wipes positions/
 # fills, restores PAPER_START_CAPITAL). Set true for one boot, then back to false.
 PAPER_RESET_ON_START    = os.getenv("PAPER_RESET_ON_START", "false").lower() == "true"
-# Weekly fresh start: on the first run of each new ISO week (Monday), wipe the
-# paper account back to PAPER_START_CAPITAL. Closed-trade history in
-# logs/paper_history.jsonl is untouched, so the dashboard's weekly/daily P&L
-# tables keep the full record. Set false to let capital compound across weeks.
-PAPER_WEEKLY_RESET      = os.getenv("PAPER_WEEKLY_RESET", "true").lower() == "true"
+# Weekly fresh start: on the first run of each new ISO week, wipe the paper account
+# back to PAPER_START_CAPITAL. Default OFF — the multi-book measurement phase needs
+# trades to accumulate for the go-live gate; a weekly wipe would discard that history
+# (closed-trade history in logs/paper_history.jsonl is kept, but the live account +
+# open/closed positions reset). Set true only for a deliberate weekly fresh start.
+PAPER_WEEKLY_RESET      = os.getenv("PAPER_WEEKLY_RESET", "false").lower() == "true"
 # Fallback lot sizes when the instruments master is unavailable (SEBI revises these
 # periodically; the master is preferred when a session is present).
 PAPER_LOT_SIZES = {

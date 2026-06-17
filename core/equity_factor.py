@@ -28,21 +28,24 @@ class EquityFactor:
         self.session = session
         self.paper = paper
         hh, mm = MARKET_OPEN.split(":")
-        self._rebal_dw = EQUITY_FACTOR_REBALANCE_DOW  # day of week (0=Mon, 4=Fri)
+        self._rebal_dw = EQUITY_FACTOR_REBALANCE_DOW  # preferred rebalance day (0=Mon, 4=Fri)
         self._rebal_t = dtime(int(hh), int(mm))
-        self._last_rebal = None
+        self._last_rebal_week = None  # (year, ISO week) of the last rebalance
 
     def step(self, now: datetime, price_lookup) -> list[str]:
         if not EQUITY_FACTOR_ENABLED or self.session is None or self.paper is None:
             return []
-        if now.weekday() >= 5:
+        if now.weekday() >= 5 or now.time() < self._rebal_t:
             return []
-        today = now.date()
-        if now.weekday() != self._rebal_dw or now.time() < self._rebal_t:
+        # Rebalance ONCE per ISO week. Prefer the configured day, but if the bot
+        # first sees the market later in the week (or was just deployed), rebalance
+        # then rather than skipping the whole week — so it always runs for measurement.
+        week = now.isocalendar()[:2]
+        if self._last_rebal_week == week:
             return []
-        if self._last_rebal == today:
-            return []  # Already rebalanced today
-        self._last_rebal = today
+        if now.weekday() < self._rebal_dw:
+            return []  # earlier than the preferred day this week — wait for it
+        self._last_rebal_week = week
         return self._rebalance(now, price_lookup)
 
     def _rebalance(self, now: datetime, price_lookup) -> list[str]:

@@ -21,6 +21,29 @@ from data.advisory_store import save_call, update_call_status
 log = get_logger("stock_options")
 
 
+def _num(v) -> float:
+    """Parse a possibly human-formatted number from the chain ('0.21M', '2.4K',
+    '1,234', 12.5) into a float. Dhan returns OI/volume as suffixed strings."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return 0.0
+    mult = 1.0
+    suf = s[-1].upper()
+    if suf in ("K", "M", "B"):
+        mult = {"K": 1e3, "M": 1e6, "B": 1e9}[suf]
+        s = s[:-1]
+    elif s[-2:].lower() == "cr":
+        mult, s = 1e7, s[:-2]
+    try:
+        return float(s) * mult
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class StockOptions:
     """Generates light stock-option calls (illiquid; high caution advised)."""
 
@@ -61,18 +84,20 @@ class StockOptions:
         if not spot or not expiry:
             return None
 
-        # Pick ATM call (closest strike <= spot).
+        # Pick ATM call (closest strike <= spot). OI/premium may arrive as formatted
+        # strings ('0.21M'), so parse via _num rather than int()/float() directly.
+        spot = _num(spot)
         calls = [r for r in chain.get("strikes", [])
-                if str(r.get("option_type", "")).upper() == "CE" and float(r.get("strike", 0)) <= spot
-                and float(r.get("premium", 0)) > 0 and int(r.get("oi", 0)) >= STOCK_OPT_MIN_OI]
+                if str(r.get("option_type", "")).upper() == "CE" and _num(r.get("strike")) <= spot
+                and _num(r.get("premium")) > 0 and _num(r.get("oi")) >= STOCK_OPT_MIN_OI]
         if not calls:
             log.debug("Stock options: no liquid ATM calls for %s (OI >= %s)", underlying, STOCK_OPT_MIN_OI)
             return None
 
-        atm = max(calls, key=lambda r: float(r["strike"]))  # Closest to spot
-        strike = int(atm["strike"])
-        premium = float(atm["premium"])
-        oi = int(atm.get("oi", 0))
+        atm = max(calls, key=lambda r: _num(r["strike"]))  # Closest to spot
+        strike = int(_num(atm["strike"]))
+        premium = _num(atm["premium"])
+        oi = int(_num(atm.get("oi")))
 
         if premium <= 0 or oi < STOCK_OPT_MIN_OI:
             return None

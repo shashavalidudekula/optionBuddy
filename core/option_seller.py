@@ -29,35 +29,50 @@ def pick_strike_by_delta(chain: dict, opt_type: str, spot: float, target_delta: 
     opt_type: 'CE' (call) or 'PE' (put).
     prefer_iv: if multiple strikes are ~equal delta, pick the one with highest IV.
     Returns the strike dict {strike, premium, delta, iv, ...} or None if not found.
+
+    Matches on the ABSOLUTE delta: Dhan reports put deltas as negative, so comparing
+    the raw delta to +target would pin the short to the deepest-OTM put (delta→0) at
+    the bottom of the chain — leaving no strike below it for a protective wing.
     """
     legs = [r for r in chain.get("strikes", [])
             if str(r.get("option_type", "")).upper() == opt_type and r.get("premium")]
     if not legs:
         return None
-    # Sort by delta distance, then by IV (descending) if prefer_iv.
+    # Sort by |delta| distance to target, then by IV (descending) if prefer_iv.
     legs_sorted = sorted(legs,
-                         key=lambda r: (abs(float(r.get("delta") or 0) - target_delta),
+                         key=lambda r: (abs(abs(float(r.get("delta") or 0)) - target_delta),
                                        -float(r.get("iv") or 0) if prefer_iv else 0))
     return legs_sorted[0] if legs_sorted else None
 
 
 def pick_wing_strike(chain: dict, short_strike: int, opt_type: str, spread_width: int,
                      direction: str = "out") -> dict | None:
-    """Pick a protective wing strike N points away from the short strike.
+    """Pick a protective wing strike ~`spread_width` points further OTM than the short.
 
-    direction='out' → wing is further OTM (lower premium, protective); 'in' → closer to spot.
-    For a call short, wing is short_strike + spread_width. For a put, wing is short_strike - spread_width.
+    Robust to sparse/edge chains: instead of requiring an EXACT strike match (which
+    failed when a deep-OTM wing has tiny/None premium and got filtered out), pick the
+    available same-type strike that is further OTM than the short and closest to the
+    target distance. The actual width is recomputed by the caller from the chosen strike.
     """
     opt_type = str(opt_type).upper()
-    if opt_type == "CE":
-        wing_strike = short_strike + (spread_width if direction == "out" else -spread_width)
-    else:  # PE
-        wing_strike = short_strike - (spread_width if direction == "out" else spread_width)
+    target = short_strike + spread_width if opt_type == "CE" else short_strike - spread_width
 
-    legs = [r for r in chain.get("strikes", [])
-            if str(r.get("option_type", "")).upper() == opt_type and int(r.get("strike", 0)) == wing_strike
-            and r.get("premium")]
-    return legs[0] if legs else None
+    cands = []
+    for r in chain.get("strikes", []):
+        if str(r.get("option_type", "")).upper() != opt_type:
+            continue
+        try:
+            k = int(float(r.get("strike", 0)))
+        except (TypeError, ValueError):
+            continue
+        otm = (k > short_strike) if opt_type == "CE" else (k < short_strike)
+        if not otm or r.get("premium") is None:  # allow 0-premium wings (deep OTM), skip only missing
+            continue
+        cands.append((abs(k - target), r))
+    if not cands:
+        return None
+    cands.sort(key=lambda x: x[0])  # closest to the target width wins
+    return cands[0][1]
 
 
 class OptionSeller:
@@ -95,7 +110,10 @@ class OptionSeller:
     def _generate_one(self, underlying: str, now: datetime) -> str | None:
         """Generate a sell call for one underlying. Returns Telegram note or None."""
         try:
-            chain = get_option_chain(self.session, underlying) or {}
+            # Wide window (ATM±35): the default ATM±4 is far too narrow for a delta-
+            # based spread — the ~0.25-delta short sits well OTM and needs strikes
+            # BELOW/ABOVE it for the protective wing. 35 strikes covers it comfortably.
+            chain = get_option_chain(self.session, underlying, count=35) or {}
         except Exception as e:  # noqa: BLE001
             log.error("Seller option-chain fetch failed for %s: %s", underlying, e)
             return None
@@ -145,17 +163,18 @@ class OptionSeller:
                        SELLING_SPREAD_WIDTH, opt_type, underlying)
             return None
 
-        wing_strike = int(wing["strike"])
-        wing_premium = float(wing["premium"])
+        wing_strike = int(float(wing["strike"]))
+        wing_premium = float(wing.get("premium") or 0.0)
         net_credit = short_premium - wing_premium
+        width = abs(short_strike - wing_strike)  # ACTUAL width of the chosen wing
 
-        if net_credit <= 0:
-            log.info("Seller: spread %s %d/%d has no credit (%.2f − %.2f = %.2f) — skipping",
-                    opt_type, short_strike, wing_strike, short_premium, wing_premium, net_credit)
+        if net_credit <= 0 or width <= 0:
+            log.info("Seller: spread %s %d/%d no credit/width (credit %.2f, width %d) — skipping",
+                    opt_type, short_strike, wing_strike, net_credit, width)
             return None
 
         lot_size = 75  # Standard index option lot size.
-        max_loss = (SELLING_SPREAD_WIDTH - net_credit) * lot_size
+        max_loss = (width - net_credit) * lot_size
         qty = lot_size
 
         instrument = f"{underlying} {short_strike}/{wing_strike} {opt_type} spread"
@@ -166,11 +185,10 @@ class OptionSeller:
             "entry_min": round(net_credit * 0.8, 2), "entry_max": round(net_credit * 1.2, 2),
             "target_1": round(net_credit * 0.5, 2),  # Take 50% of credit
             "target_2": round(0.0, 2),  # Expire worthless
-            "stop_loss": round(max_loss * 2 / lot_size, 2),  # Stop at 2× max loss (on a scale of 1 lot)
+            "stop_loss": round(net_credit * 2, 2),  # Stop at 2× the net credit (per unit)
             "confidence": 75,
             "rationale": (f"Defined-risk {opt_type} spread: sell {short_strike} / buy {wing_strike} "
-                         f"(delta {short_delta:.2f}, width {SELLING_SPREAD_WIDTH}). "
-                         f"Max loss ₹{max_loss:.0f}."),
+                         f"(delta {short_delta:.2f}, width {width}). Max loss ₹{max_loss:.0f}."),
             "option_expiry": expiry,
             "strategy": "opt_sell_spread",
             # Embedded data so PaperTrader can fully automate the spread (both legs).
@@ -179,7 +197,7 @@ class OptionSeller:
             "_wing_strike": wing_strike,
             "_short_premium": round(short_premium, 2),
             "_wing_premium": round(wing_premium, 2),
-            "_width_points": SELLING_SPREAD_WIDTH,
+            "_width_points": width,
         }
         try:
             call_id = save_call(call)

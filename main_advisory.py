@@ -361,7 +361,6 @@ async def run() -> None:
 
     # One-time destructive reset of the paper account (set the flag for one boot).
     if PAPER_RESET_ON_START:
-        from data.advisory_store import reset_paper_account
         reset_paper_account(PAPER_START_CAPITAL)
         log.warning("PAPER_RESET_ON_START=true — paper account reset to ₹%.0f. "
                     "Set it back to false to avoid resetting on the next boot.",
