@@ -36,6 +36,17 @@ class Broker:
                    reason: str = "exit") -> dict | None:
         return None
 
+    def fetch_positions(self) -> dict | None:
+        """Net open quantity per scrip code: {"SEG:securityId": net_qty} (signed:
+        + long, − short). Used to reconcile internal state against the real account.
+
+        Return convention (so reconciliation can't false-alarm on a hiccup):
+          None → cannot report (paper / unsupported / fetch error) → skip this cycle
+          {}   → fetched OK, the account is genuinely flat
+        Paper has no broker book, so the base returns None.
+        """
+        return None
+
 
 class PaperBroker(Broker):
     """Explicit paper broker — simulation is handled by PaperTrader's cash model."""
@@ -91,6 +102,39 @@ class DhanBroker(Broker):
     def _resolve(call):
         from core.market_data_provider import resolve_scrip_for_call
         return resolve_scrip_for_call(call)
+
+    # Read-only — safe to call regardless of DHAN_ALLOW_LIVE_ORDERS (no money moves).
+    def fetch_positions(self):
+        """Net open qty per scrip from Dhan's day positions: {"SEG:id": net_qty}.
+
+        Envelope VERIFIED live 2026-06-16: DhanHQ v2 GET /positions returns a BARE
+        JSON LIST (not wrapped in {"data": [...]}) — both shapes are handled below.
+        Rows follow Dhan's documented schema: exchangeSegment, securityId, netQty
+        (signed), positionType (LONG/SHORT/CLOSED). Row fields are NOT yet confirmed
+        against a real position (the account was flat at verification) — re-confirm on
+        the first live position. Returns None on failure so reconciliation skips.
+        """
+        try:
+            resp = self.session.get("/positions")
+        except Exception as e:  # noqa: BLE001
+            log.error("Dhan fetch_positions failed: %s", e)
+            return None
+        rows = resp.get("data") if isinstance(resp, dict) else resp
+        out: dict[str, int] = {}
+        for r in (rows or []):
+            seg = r.get("exchangeSegment") or r.get("exchange_segment")
+            sid = r.get("securityId") or r.get("security_id")
+            if seg is None or sid is None:
+                continue
+            net = int(float(r.get("netQty", r.get("net_qty", 0)) or 0))
+            ptype = str(r.get("positionType") or r.get("position_type") or "").upper()
+            if ptype == "CLOSED" or net == 0:
+                continue
+            if ptype == "SHORT" and net > 0:
+                net = -net
+            code = f"{seg}:{sid}"
+            out[code] = out.get(code, 0) + net
+        return out
 
 
 def get_broker(session=None) -> Broker:

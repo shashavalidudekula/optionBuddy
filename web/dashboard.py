@@ -21,7 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from config.logger import get_logger
+from config.settings import (
+    PAPER_START_CAPITAL, SELLING_ENABLED, SELLING_STRUCTURE,
+    STOCK_OPT_ENABLED, EQUITY_FACTOR_ENABLED,
+)
 from data.advisory_store import (
+    init_advisory_db,
     get_active_calls,
     get_closed_calls,
     get_paper_stats,
@@ -29,12 +34,68 @@ from data.advisory_store import (
     get_closed_paper_positions,
     get_not_executed_calls,
     get_call_levels,
+    ensure_paper_account,
+    DEFAULT_STRATEGY,
 )
 from data.paper_history import daily_pnl, weekly_pnl
 
 log = get_logger("dashboard")
 
 app = FastAPI(title="OptionBuddy Dashboard", docs_url=None, redoc_url=None)
+
+# Which books to surface, with the same capital tiers main_advisory uses. opt_buy
+# always shows; the rest appear once their feature flag is on (so we don't render
+# empty books the user never enabled). Keep these in sync with main_advisory.
+_BOOK_CAPITAL = {
+    DEFAULT_STRATEGY: PAPER_START_CAPITAL,
+    "opt_sell_spread": 300000,
+    "opt_sell_naked": 500000,
+    "stock_opt": 200000,
+    "equity_cash": 300000,
+}
+
+
+def _enabled_books() -> dict:
+    """The books this deployment runs (opt_buy always; others by config flag)."""
+    books = {DEFAULT_STRATEGY: _BOOK_CAPITAL[DEFAULT_STRATEGY]}
+    if SELLING_ENABLED:
+        books["opt_sell_spread"] = _BOOK_CAPITAL["opt_sell_spread"]
+        if SELLING_STRUCTURE.lower() == "naked":
+            books["opt_sell_naked"] = _BOOK_CAPITAL["opt_sell_naked"]
+    if STOCK_OPT_ENABLED:
+        books["stock_opt"] = _BOOK_CAPITAL["stock_opt"]
+    if EQUITY_FACTOR_ENABLED:
+        books["equity_cash"] = _BOOK_CAPITAL["equity_cash"]
+    return books
+
+
+_BOOTSTRAPPED = False
+
+
+def _ensure_bootstrap() -> bool:
+    """Self-heal the schema + ensure the enabled book accounts exist, so the
+    dashboard shows them even if the agent container hasn't started yet.
+    init_advisory_db is idempotent (CREATE/ALTER ... IF NOT EXISTS) and backfills
+    the legacy single account to strategy='opt_buy'. Runs once on success; retries
+    on every request until the DB is reachable. Independent of the startup hook so
+    a missed/late startup event can never leave the books empty."""
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return True
+    try:
+        init_advisory_db()
+        for strategy, capital in _enabled_books().items():
+            ensure_paper_account(capital, strategy)
+        _BOOTSTRAPPED = True
+        log.info("Dashboard bootstrap OK — books: %s", ",".join(_enabled_books()))
+    except Exception as e:  # noqa: BLE001
+        log.error("Dashboard bootstrap failed (will retry next request): %s", e)
+    return _BOOTSTRAPPED
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _ensure_bootstrap()
 
 _USER = os.getenv("DASHBOARD_USER", "")
 _PASS = os.getenv("DASHBOARD_PASS", "")
@@ -67,37 +128,51 @@ def _row(d: dict) -> dict:
 
 
 def _state() -> dict:
-    stats = get_paper_stats() or {}
-    open_pos = get_open_paper_positions()
-    levels = get_call_levels([p.get("call_id") for p in open_pos]) if open_pos else {}
+    # Make sure the schema is migrated and the enabled book accounts exist before
+    # we read them (idempotent; runs once on success, retries until the DB is up).
+    _ensure_bootstrap()
 
-    open_out = []
-    for p in open_pos:
-        last = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
-        entry = float(p["entry_price"])
-        sign = 1 if str(p["action"]).upper() == "BUY" else -1
-        upnl = round(sign * int(p["remaining_qty"]) * (last - entry), 2)
-        lv = levels.get(p.get("call_id")) or {}
-        row = _row(p)
-        row.update({
-            "ltp": round(last, 2),
-            "unrealized_pnl": upnl,
-            "target_1": _clean(lv.get("target_1")),
-            "target_2": _clean(lv.get("target_2")),
-            "stop_loss": _clean(lv.get("stop_loss")),
-            "option_expiry": _clean(lv.get("option_expiry")),
-        })
-        open_out.append(row)
+    # Surface the books this deployment runs (opt_buy always; others by flag).
+    books = {}
+    for strategy in _enabled_books():
+        try:
+            stats = get_paper_stats(strategy) or {}
+            if not stats.get("starting_capital"):
+                continue  # Strategy account doesn't exist yet
+            open_pos = get_open_paper_positions(strategy)
+            levels = get_call_levels([p.get("call_id") for p in open_pos]) if open_pos else {}
+
+            open_out = []
+            for p in open_pos:
+                last = float(p["last_price"]) if p["last_price"] is not None else float(p["entry_price"])
+                entry = float(p["entry_price"])
+                sign = 1 if str(p["action"]).upper() == "BUY" else -1
+                upnl = round(sign * int(p["remaining_qty"]) * (last - entry), 2)
+                lv = levels.get(p.get("call_id")) or {}
+                row = _row(p)
+                row.update({
+                    "ltp": round(last, 2),
+                    "unrealized_pnl": upnl,
+                    "target_1": _clean(lv.get("target_1")),
+                    "target_2": _clean(lv.get("target_2")),
+                    "stop_loss": _clean(lv.get("stop_loss")),
+                    "option_expiry": _clean(lv.get("option_expiry")),
+                })
+                open_out.append(row)
+
+            books[strategy] = {
+                "stats": {k: _clean(v) for k, v in stats.items()},
+                "open": open_out,
+                "closed": [_row(p) for p in get_closed_paper_positions(80, strategy)],
+                "daily": [_row(d) for d in daily_pnl(30)],  # Global (all strategies)
+                "weekly": [_row(d) for d in weekly_pnl(12)],  # Global (all strategies)
+            }
+        except Exception as e:  # noqa: BLE001
+            log.debug("Strategy %s fetch failed: %s", strategy, e)
 
     return {
         "now": datetime.now().isoformat(timespec="seconds"),
-        "paper": {
-            "stats": {k: _clean(v) for k, v in stats.items()},
-            "open": open_out,
-            "closed": [_row(p) for p in get_closed_paper_positions(80)],
-            "daily": [_row(d) for d in daily_pnl(30)],
-            "weekly": [_row(d) for d in weekly_pnl(12)],
-        },
+        "books": books,
         "calls": {
             "active": [_row(c) for c in get_active_calls()],
             "closed": [_row(c) for c in get_closed_calls(80)],
@@ -198,12 +273,8 @@ _PAGE = """<!doctype html>
   <span class="right">auto-refresh 20s · IST · shadow money · advisory only</span>
 </header>
 <main>
-  <div class="cards" id="cards"></div>
-  <div class="row">
-    <div id="weekly"></div>
-    <div id="daily"></div>
-  </div>
-  <div id="open"></div>
+  <div class="tabs" id="bookTabs"></div>
+  <div id="bookContent"></div>
   <div class="row">
     <div id="col-opt"></div>
     <div id="col-oth"></div>
@@ -241,6 +312,7 @@ const entryLtp = c => {
 const targets = c => [c.target_1,c.target_2].filter(x=>x!=null).map(r2).join(" · ")||"—";
 
 let NOW=null;  // server "now" (set each render) — drives the stage timers
+let bookState = 'opt_buy';  // current book tab
 const _ms = v => v?Date.parse(String(v).replace(" ","T")):NaN;
 const since = iso => { const d=_ms(NOW)-_ms(iso); return (isNaN(d)||d<0)?null:d; };
 const human = ms => { if(ms==null) return "—"; const m=Math.round(ms/60000);
@@ -285,69 +357,101 @@ function capBox(title, tag, count, inner, cls, foot){
     <div class="bd panel">${inner}</div>${foot?`<div class="foot">${foot}</div>`:''}</div>`;
 }
 
-function render(s){
-  NOW = s.now;
-  const st = s.paper.stats || {};
-  document.getElementById('updated').innerHTML = '<span class="dot">●</span> live · updated ' + (s.now||"").replace("T"," ") + ' IST';
-  const ret = st.total_return_pct;
+function renderBookContent(book, st){
+  // Render one book's content: cards + positions + P&L tables (for opt_buy at end).
+  // NOTE: the API nests the summary under st.stats; the open/closed/daily/weekly
+  // arrays are top-level on st.
+  const sx = st.stats || {};
+  const ret = sx.total_return_pct;
   const cards = [
-    ["Equity", r0(st.equity), arrowPct(ret)],
-    ["Free cash", r0(st.free_cash), null],
-    ["Deployed", r0(st.deployed_capital), null],
-    ["Realised", r0(st.realized_pnl), null, sgn(st.realized_pnl)],
-    ["Unrealised", r0(st.unrealized_pnl), null, sgn(st.unrealized_pnl)],
-    ["Today", r0(st.today_realized), null, sgn(st.today_realized)],
-    ["Win rate", f(st.win_rate,1)+"%", null],
-    ["Closed", f0(st.closed_trades)+' <span class="dim">W'+f0(st.wins)+"/L"+f0(st.losses)+"</span>", null],
-    ["Max DD", f(st.max_drawdown_pct)+"%", null, "neg"],
-    ["Open", f0(st.open_positions), null],
+    ["Equity", r0(sx.equity), arrowPct(ret)],
+    ["Free cash", r0(sx.free_cash), null],
+    ["Margin used", r0(sx.margin_used), null],
+    ["Deployed", r0(sx.deployed_capital), null],
+    ["Realised", r0(sx.realized_pnl), null, sgn(sx.realized_pnl)],
+    ["Unrealised", r0(sx.unrealized_pnl), null, sgn(sx.unrealized_pnl)],
+    ["Today", r0(sx.today_realized), null, sgn(sx.today_realized)],
+    ["Win rate", f(sx.win_rate,1)+"%", null],
+    ["Closed", f0(sx.closed_trades)+' <span class="dim">W'+f0(sx.wins)+"/L"+f0(sx.losses)+"</span>", null],
+    ["Max DD", f(sx.max_drawdown_pct)+"%", null, "neg"],
+    ["Open", f0(sx.open_positions), null],
   ];
-  document.getElementById('cards').innerHTML = cards.map(c=>
-    `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[3]||''}">${c[1]}</div>${c[2]?`<div class="sub">${c[2]}</div>`:''}</div>`).join('');
-
-  // P&L breakdown rows — shared between the weekly and daily tables.
-  const dayfmt = v => { if(!v) return "—"; const d=new Date(v+"T00:00:00");
-    return d.toLocaleDateString("en-IN",{weekday:"short",day:"2-digit",month:"short"}); };
-  const weekfmt = v => { if(!v) return "—"; const a=new Date(v+"T00:00:00");
-    const b=new Date(a); b.setDate(b.getDate()+4);  // Mon → Fri
-    const o={day:"2-digit",month:"short"};
-    return a.toLocaleDateString("en-IN",o)+" – "+b.toLocaleDateString("en-IN",o); };
-  const PNL_HEAD = lbl => [{t:lbl,l:1},{t:"Trades"},{t:"Wins"},{t:"Losses"},{t:"Win %"},{t:"Profit"},{t:"Loss"},{t:"Costs"},{t:"Net P&L"}];
-  const pnlRow = (label, d) => `<tr>
-      <td class="l">${label}</td>
-      <td>${f0(d.trades)}</td>
-      <td class="pos">${f0(d.wins)}</td>
-      <td class="neg">${f0(d.losses)}</td>
-      <td class="${d.win_rate>=50?'pos':'neg'}">${f(d.win_rate,1)}%</td>
-      <td class="pos">${d.gross_profit>0?"+"+r0(d.gross_profit):"—"}</td>
-      <td class="neg">${d.gross_loss<0?r0(d.gross_loss):"—"}</td>
-      <td class="dim">${d.costs>0?"−"+r0(d.costs):"—"}</td>
-      <td class="${sgn(d.net_pnl)}">${d.net_pnl>=0?"+":""}${r0(d.net_pnl)}</td></tr>`;
-
-  // Weekly P&L — resets each Monday with fresh capital; history kept for tracking.
-  const wk = s.paper.weekly || [];
-  const weeklyTbl = wk.length
-    ? tbl(PNL_HEAD("Week"), wk.map(d=>pnlRow(weekfmt(d.period), d)))
-    : '<div class="empty">No closed trades yet.</div>';
-  document.getElementById('weekly').innerHTML = capBox('Weekly P&L', 'by week · Mon–Fri', wk.length, weeklyTbl, 'short');
-
-  // Daily P&L
-  const dd = s.paper.daily || [];
-  const dailyTbl = dd.length
-    ? tbl(PNL_HEAD("Date"), dd.map(d=>pnlRow(dayfmt(d.period), d)))
-    : '<div class="empty">No closed trades yet.</div>';
-  document.getElementById('daily').innerHTML = capBox('Daily P&L', 'by day', dd.length, dailyTbl, 'short');
+  let html = '<div class="cards">' + cards.map(c=>
+    `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[3]||''}">${c[1]}</div>${c[2]?`<div class="sub">${c[2]}</div>`:''}</div>`).join('') + '</div>';
 
   // Open positions
-  const op = s.paper.open;
+  const op = st.open||[];
   const opTbl = op.length ? tbl(
     [{t:"# / Instrument",l:1},{t:"Held",l:1},{t:"Entry / LTP",l:1},{t:"Targets"},{t:"Stop"},{t:"uP&L"}],
     op.map(p=>`<tr><td class="l"><span class="dim">#${p.call_id}</span> ${side(p.action)} ${xp(p.option_expiry)}${esc(p.instrument)}</td>
       <td class="l"><span class="pill">in trade ${human(since(p.opened_at))}</span></td><td class="l">${entryLtp(p)}</td>
       <td>${targets(p)}</td><td>${p.stop_loss!=null?r2(p.stop_loss):"—"}</td>
       <td class="${sgn(p.unrealized_pnl)}">${p.unrealized_pnl>=0?"+":""}${r0(p.unrealized_pnl)}</td></tr>`))
-    : '<div class="empty">No open positions — engine is flat.</div>';
-  document.getElementById('open').innerHTML = capBox('Open Positions', 'paper · live', op.length, opTbl, 'short');
+    : '<div class="empty">No open positions — flat.</div>';
+  html += capBox('Open Positions', 'paper · live', op.length, opTbl, 'short');
+
+  // Closed positions
+  const cp = st.closed||[];
+  const cpTbl = cp.length ? tbl(
+    [{t:"Instrument",l:1},{t:"Flow",l:1},{t:"P&L"},{t:"Closed",l:1}],
+    cp.slice(0,40).map(p=>`<tr><td class="l">${side(p.action)} ${esc(p.instrument)}</td>
+      <td class="l"><span class="dim">in</span> ${r2(p.entry_price)} <span class="dim">out</span> ${p.last_price!=null?r2(p.last_price):"—"}</td>
+      <td class="${sgn(p.realized_pnl)}">${p.realized_pnl>=0?"+":""}${r0(p.realized_pnl)}</td>
+      <td class="l">${tm(p.closed_at)}</td></tr>`))
+    : '<div class="empty">No closed trades yet.</div>';
+  html += capBox('Closed Positions', 'history', cp.length, cpTbl, 'short', cp.length>40?('showing 40 of '+cp.length):'');
+
+  // For opt_buy only, show weekly/daily at the end.
+  if(book==='opt_buy'){
+    const dayfmt = v => { if(!v) return "—"; const d=new Date(v+"T00:00:00");
+      return d.toLocaleDateString("en-IN",{weekday:"short",day:"2-digit",month:"short"}); };
+    const weekfmt = v => { if(!v) return "—"; const a=new Date(v+"T00:00:00");
+      const b=new Date(a); b.setDate(b.getDate()+4);
+      const o={day:"2-digit",month:"short"};
+      return a.toLocaleDateString("en-IN",o)+" – "+b.toLocaleDateString("en-IN",o); };
+    const PNL_HEAD = lbl => [{t:lbl,l:1},{t:"Trades"},{t:"Wins"},{t:"Losses"},{t:"Win %"},{t:"Profit"},{t:"Loss"},{t:"Costs"},{t:"Net P&L"}];
+    const pnlRow = (label, d) => `<tr>
+        <td class="l">${label}</td>
+        <td>${f0(d.trades)}</td>
+        <td class="pos">${f0(d.wins)}</td>
+        <td class="neg">${f0(d.losses)}</td>
+        <td class="${d.win_rate>=50?'pos':'neg'}">${f(d.win_rate,1)}%</td>
+        <td class="pos">${d.gross_profit>0?"+"+r0(d.gross_profit):"—"}</td>
+        <td class="neg">${d.gross_loss<0?r0(d.gross_loss):"—"}</td>
+        <td class="dim">${d.costs>0?"−"+r0(d.costs):"—"}</td>
+        <td class="${sgn(d.net_pnl)}">${d.net_pnl>=0?"+":""}${r0(d.net_pnl)}</td></tr>`;
+
+    const wk = st.weekly||[];
+    const dd = st.daily||[];
+    html += '<div class="row">';
+    html += capBox('Weekly P&L', 'by week', wk.length,
+      wk.length ? tbl(PNL_HEAD("Week"), wk.map(d=>pnlRow(weekfmt(d.period), d))) : '<div class="empty">No data yet.</div>', 'short');
+    html += capBox('Daily P&L', 'by day', dd.length,
+      dd.length ? tbl(PNL_HEAD("Date"), dd.map(d=>pnlRow(dayfmt(d.period), d))) : '<div class="empty">No data yet.</div>', 'short');
+    html += '</div>';
+  }
+
+  return html;
+}
+
+function render(s){
+  NOW = s.now;
+  document.getElementById('updated').innerHTML = '<span class="dot">●</span> live · updated ' + (s.now||"").replace("T"," ") + ' IST';
+
+  // Book tabs
+  const books = Object.keys(s.books||{});
+  if(!books.length) {
+    document.getElementById('bookTabs').innerHTML = '<span class="mut">no paper books active</span>';
+    return;
+  }
+  const bookTabs = books.map(b => `<button class="tab ${b===bookState?'active':''}" onclick="switchBook('${b}')">${b}</button>`).join('');
+  document.getElementById('bookTabs').innerHTML = bookTabs;
+
+  // Render current book
+  const st = s.books[bookState] || s.books[books[0]];
+  document.getElementById('bookContent').innerHTML = renderBookContent(bookState, st);
+
+  window.switchBook = function(book){ bookState = book; render(window.lastData); };
 
   const act = s.calls.active;
   const byU = u => act.filter(c=>c.category==='index_option' && (c.underlying||'').toUpperCase()===u);
@@ -360,16 +464,6 @@ function render(s){
     {k:"FUTURES", n:act.filter(c=>c.category==='futures').length, html:callTbl(act.filter(c=>c.category==='futures'))},
     {k:"STOCKS",  n:act.filter(c=>c.category==='equity').length,  html:callTbl(act.filter(c=>c.category==='equity'))},
   ]);
-
-  // Paper ledger (under options) — Flow in/out format
-  const led = s.paper.closed;
-  document.getElementById('ledger').innerHTML = capBox('Paper Ledger', 'executed', led.length, tbl(
-    [{t:"Instrument",l:1},{t:"Flow",l:1},{t:"P&L"},{t:"Closed",l:1}],
-    led.slice(0,40).map(p=>`<tr><td class="l">${side(p.action)} ${esc(p.instrument)}</td>
-      <td class="l"><span class="dim">in</span> ${r2(p.entry_price)} <span class="dim">out</span> ${p.last_price!=null?r2(p.last_price):"—"}</td>
-      <td class="${sgn(p.realized_pnl)}">${p.realized_pnl>=0?"+":""}${r0(p.realized_pnl)}</td>
-      <td class="l">${tm(p.closed_at)}</td></tr>`)),
-    'short', led.length>40?('showing 40 of '+led.length):'');
 
   // Closed calls (under futures) — futures + stocks only, no index options
   const cc = s.calls.closed.filter(c=>c.category==='futures'||c.category==='equity');
@@ -393,18 +487,42 @@ function render(s){
   applyTabs('opt'); applyTabs('oth');
 }
 
+let lastData = null;
+
 async function tick(){
   try{
     const r = await fetch('api/state',{cache:'no-store'});
     if(!r.ok) throw new Error('http '+r.status);
     const data = await r.json();
-    try{ render(data); }
+    window.lastData = data;
+    try{ render(data); renderGlobal(data); }
     catch(err){ document.getElementById('updated').textContent = "render error: " + (err && err.message); throw err; }
   }catch(e){
     const u=document.getElementById('updated');
     if(!/render error/.test(u.textContent)) u.innerHTML = '<span class="dot" style="color:var(--red)">●</span> connection error — retrying…';
   }
 }
+
+// Render global ledger/closed sections (not book-specific)
+function renderGlobal(s){
+  const REASON = {unfunded:"capital exhausted", capped:"max positions", halted_daily_loss:"daily-loss halt", risk_skip:"per-trade risk cap"};
+  const ne = s.calls.not_executed || [];
+  document.getElementById('notexec').innerHTML = capBox('Generated · Not Executed', 'no capital / limits', ne.length, tbl(
+    [{t:"Cat",l:1},{t:"Side"},{t:"Instrument",l:1},{t:"Reason"},{t:"Conf"},{t:"Time",l:1}],
+    ne.slice(0,40).map(c=>`<tr><td class="l mut">${CAT[c.category]||c.category}</td><td>${side(c.action)}</td>
+      <td class="l">${esc(c.instrument)}</td><td><span class="pill">${REASON[c.paper_status]||c.paper_status}</span></td>
+      <td>${c.confidence!=null?c.confidence+"%":"—"}</td><td class="l">${tm(c.issued_at)}</td></tr>`)),
+    'short', ne.length>40?('showing 40 of '+ne.length):'');
+
+  const cc = s.calls.closed.filter(c=>c.category==='futures'||c.category==='equity');
+  document.getElementById('closed').innerHTML = capBox('Closed Calls', 'advisory log', cc.length, tbl(
+    [{t:"Cat",l:1},{t:"Side"},{t:"Instrument",l:1},{t:"Result"},{t:"Time",l:1}],
+    cc.slice(0,40).map(c=>`<tr><td class="l mut">${CAT[c.category]||c.category}</td><td>${side(c.action)}</td>
+      <td class="l">${esc(c.instrument)}</td><td>${arrowPct(c.result_pct)}</td>
+      <td class="l">${tm(c.issued_at)}</td></tr>`)),
+    'short', cc.length>40?('showing 40 of '+cc.length):'');
+}
+
 tick(); setInterval(tick, 20000);
 </script>
 </body>

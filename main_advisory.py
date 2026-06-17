@@ -32,10 +32,15 @@ from config.settings import (
     OPT_GEN_MIN_GAP_SEC, OPT_GEN_FLOOR_SEC, GEN_MOVE_PCT, GEN_VIX_JUMP_PCT,
     OTHER_GEN_INTERVAL_MIN, ATM_STEP, EOD_SQUARE_OFF_ALL,
     GEN_HALT_TIME, EOD_CLOSE_TIME, EOD_DIGEST_TIME, GEN_RESUME_TIME,
-    OPENING_SCALP_ENABLED,
+    OPENING_SCALP_ENABLED, FEED_ALERTS_ENABLED, FEED_STALE_SEC,
+    EXECUTION_MODE, RECONCILE_ENABLED, RECONCILE_INTERVAL_SEC,
+    SELLING_ENABLED, SELLING_UNDERLYINGS, SELLING_STRUCTURE,
+    EQUITY_FACTOR_ENABLED, EQUITY_FACTOR_UNIVERSE,
+    STOCK_OPT_ENABLED, STOCK_OPT_UNDERLYINGS,
 )
 from data.advisory_store import (
     CATEGORIES,
+    DEFAULT_STRATEGY,
     init_advisory_db,
     save_call,
     active_instruments,
@@ -50,7 +55,11 @@ from core.call_tracker import (
 )
 from core.paper_trader import PaperTrader
 from core.opening_scalp import OpeningScalp
+from core.option_seller import OptionSeller
+from core.equity_factor import EquityFactor
+from core.stock_options import StockOptions
 from core.execution import get_broker
+from core import heartbeat
 from core.market_data_provider import (
     get_session,
     get_market_snapshot, make_price_lookup, get_option_chain, get_index_spots,
@@ -281,7 +290,7 @@ class OptionGenTrigger:
             self.ref_vix = spots["indiavix"]
 
 
-async def run_tracking_pass(bot: TelegramAdvisoryBot, price_lookup, paper: PaperTrader | None) -> None:
+async def run_tracking_pass(bot: TelegramAdvisoryBot, price_lookup, traders: dict[str, PaperTrader]) -> None:
     events = await asyncio.to_thread(track_active_calls, price_lookup)
     for evt in events:
         await bot.push_call_event(evt)
@@ -289,9 +298,10 @@ async def run_tracking_pass(bot: TelegramAdvisoryBot, price_lookup, paper: Paper
         log.info("Tracking pass emitted %s event(s)", len(events))
 
     # Shadow/paper trading reacts to the same lifecycle events (zero real money).
-    if paper is not None:
-        await asyncio.to_thread(paper.mark_to_market, price_lookup)
-        notes = await asyncio.to_thread(paper.process_events, events)
+    # Each trader processes only its strategy's events (routed by call.strategy field).
+    for strategy, trader in traders.items():
+        await asyncio.to_thread(trader.mark_to_market, price_lookup)
+        notes = await asyncio.to_thread(trader.process_events, events)
         for note in notes:
             await bot.notify_owner(note)
 
@@ -378,23 +388,85 @@ async def run() -> None:
 
     price_lookup = make_price_lookup(session)
 
-    paper: PaperTrader | None = None
-    if PAPER_TRADING_ENABLED:
-        try:
-            # Broker routes orders only in EXECUTION_MODE=live (and still double-guarded);
-            # in paper mode it's a no-op, so simulation behaviour is unchanged.
-            paper = PaperTrader(session, broker=get_broker(session))
-        except Exception as e:
-            log.error("Paper trader init failed (%s); continuing without it.", e)
+    # Broker routes orders only in EXECUTION_MODE=live (and still double-guarded);
+    # in paper mode it's a no-op. Captured here so reconciliation can read its book.
+    broker = get_broker(session)
 
-    # Deterministic opening gap-fade scalp (OFF unless OPENING_SCALP_ENABLED).
+    # Multi-strategy paper books: one PaperTrader per strategy. Each is capital-separated,
+    # margin-tracked, and reports independently.
+    traders: dict[str, PaperTrader] = {}
+    if PAPER_TRADING_ENABLED:
+        # 1. opt_buy: index option buying (existing engine, with LLM)
+        try:
+            traders[DEFAULT_STRATEGY] = PaperTrader(session, broker=broker, strategy=DEFAULT_STRATEGY,
+                                                   allow_buy=True, allow_sell=False)
+        except Exception as e:
+            log.error("Paper trader [opt_buy] init failed (%s); continuing without it.", e)
+
+        # 2. opt_sell_spread: defined-risk credit spreads (deterministic, no LLM)
+        if SELLING_ENABLED:
+            try:
+                traders["opt_sell_spread"] = PaperTrader(session, broker=broker, strategy="opt_sell_spread",
+                                                        capital=300000, allow_buy=False, allow_sell=True)
+            except Exception as e:
+                log.error("Paper trader [opt_sell_spread] init failed (%s); continuing without it.", e)
+
+        # 3. opt_sell_naked: naked shorts (deterministic, no LLM, higher risk/reward)
+        if SELLING_ENABLED and SELLING_STRUCTURE.lower() == "naked":
+            try:
+                traders["opt_sell_naked"] = PaperTrader(session, broker=broker, strategy="opt_sell_naked",
+                                                       capital=500000, allow_buy=False, allow_sell=True)
+            except Exception as e:
+                log.error("Paper trader [opt_sell_naked] init failed (%s); continuing without it.", e)
+
+        # 4. stock_opt: stock options (minimal LLM, illiquid, buying only). Its calls are
+        #    tagged category="stock_option", so the trader must scope to that — otherwise
+        #    its own lifecycle (exit) events get filtered out and positions never close.
+        if STOCK_OPT_ENABLED:
+            try:
+                traders["stock_opt"] = PaperTrader(session, broker=broker, strategy="stock_opt",
+                                                  capital=200000, allow_buy=True, allow_sell=False,
+                                                  categories=["stock_option"])
+            except Exception as e:
+                log.error("Paper trader [stock_opt] init failed (%s); continuing without it.", e)
+
+        # 5. equity_cash: equity stock buying (factor/momentum, deterministic, no LLM)
+        if EQUITY_FACTOR_ENABLED:
+            try:
+                traders["equity_cash"] = PaperTrader(session, broker=broker, strategy="equity_cash",
+                                                    capital=300000, allow_buy=True, allow_sell=False,
+                                                    categories=["equity_cash"])
+            except Exception as e:
+                log.error("Paper trader [equity_cash] init failed (%s); continuing without it.", e)
+
+    paper = traders.get(DEFAULT_STRATEGY)  # Backward-compat: `paper` = opt_buy
+
+    # Deterministic strategy generators: OpeningScalp generates index option BUYS (routed to opt_buy);
+    # the sellers/equity/stock-opt generate their own calls with strategy field set.
     scalp = OpeningScalp(session, paper) if (OPENING_SCALP_ENABLED and paper is not None) else None
     if scalp is not None:
         log.info("Opening gap scalp ENABLED — normal generation suppressed until %s", GEN_RESUME_TIME)
 
+    sellers = {}
+    if SELLING_ENABLED:
+        # Two seller variants: spread-based and naked. Each routes to its own book + trader.
+        if "opt_sell_spread" in traders:
+            sellers["opt_sell_spread"] = OptionSeller(session, traders["opt_sell_spread"])
+        # Naked is the same class, just configured differently. To run both, instantiate twice.
+        # For now, keep it simple: just the spread variant runs (SELLING_STRUCTURE="spread" by default).
+
+    equity_factor = EquityFactor(session, traders.get("equity_cash")) if EQUITY_FACTOR_ENABLED else None
+    stock_opts = StockOptions(session, traders.get("stock_opt")) if STOCK_OPT_ENABLED else None
+
     opt_trigger = OptionGenTrigger()
     other_categories = [c for c in CATEGORIES if c != "index_option"]
     last_other_gen: datetime | None = None
+    # Feed-health watchdog state (only evaluated inside the active polling window).
+    last_feed_ok = time.monotonic()
+    feed_alerted = False
+    # Position-reconciliation state (LIVE only): throttle + de-dupe repeat alerts.
+    last_reconcile = 0.0
+    reconcile_sig = None
     briefing_date = None
     premarket_date = None
     gen_halt_date = None
@@ -429,6 +501,13 @@ async def run() -> None:
         while True:
             now = datetime.now()
             today = now.date()
+
+            # Liveness stamp for the Docker healthcheck — every iteration, so a hung
+            # loop or dead process goes stale and the container is marked unhealthy.
+            try:
+                heartbeat.beat()
+            except Exception as e:  # noqa: BLE001
+                log.debug("Heartbeat write failed: %s", e)
 
             # Weekly fresh start — on the first loop of a new ISO week, wipe the
             # paper account back to PAPER_START_CAPITAL. Durable history (jsonl)
@@ -476,7 +555,7 @@ async def run() -> None:
                 briefing_date = today
 
             if _in_market_hours(now):
-                # 0) Opening gap-fade scalp — deterministic, runs in the first minutes.
+                # 0a) Opening gap-fade scalp — deterministic, runs in the first minutes.
                 if scalp is not None:
                     try:
                         for note in await asyncio.to_thread(scalp.step, now, price_lookup):
@@ -484,11 +563,64 @@ async def run() -> None:
                     except Exception as e:
                         log.error("Opening scalp step failed: %s", e)
 
+                # 0b) Option-selling strategies — daily generation (spreads/naked).
+                for seller in sellers.values():
+                    try:
+                        for note in await asyncio.to_thread(seller.step, now, price_lookup):
+                            await bot.notify_owner(note)
+                    except Exception as e:
+                        log.error("Option seller step failed: %s", e)
+
+                # 0c) Equity factor — weekly/monthly rebalance.
+                if equity_factor is not None:
+                    try:
+                        for note in await asyncio.to_thread(equity_factor.step, now, price_lookup):
+                            await bot.notify_owner(note)
+                    except Exception as e:
+                        log.error("Equity factor step failed: %s", e)
+
+                # 0d) Stock options — daily generation (light, illiquid).
+                if stock_opts is not None:
+                    try:
+                        for note in await asyncio.to_thread(stock_opts.step, now, price_lookup):
+                            await bot.notify_owner(note)
+                    except Exception as e:
+                        log.error("Stock options step failed: %s", e)
+
                 # 1) Lifecycle tracking every poll — the near-real-time entry/exit layer.
                 try:
-                    await run_tracking_pass(bot, price_lookup, paper)
+                    await run_tracking_pass(bot, price_lookup, traders)
                 except Exception as e:
                     log.error("Tracking pass failed: %s", e)
+
+                # 1b) Reconcile internal positions vs the broker's book (LIVE only).
+                #     Read-only: alerts on any mismatch so a rejected/partial fill
+                #     can't leave internal state silently out of sync. Paper has no
+                #     broker book, so this is gated to live mode.
+                if (RECONCILE_ENABLED and traders and EXECUTION_MODE == "live"
+                        and time.time() - last_reconcile >= RECONCILE_INTERVAL_SEC):
+                    last_reconcile = time.time()
+                    try:
+                        from core.reconcile import run_reconciliation
+                        divergences = await asyncio.to_thread(run_reconciliation, broker)
+                        if divergences:  # non-empty → mismatch
+                            sig = tuple(sorted((d["code"], d["internal"], d["broker"])
+                                               for d in divergences))
+                            if sig != reconcile_sig:  # only alert when the picture changes
+                                reconcile_sig = sig
+                                detail = "\n".join(
+                                    f"• {d['code']}: bot {d['internal']} vs broker {d['broker']} "
+                                    f"(Δ{d['diff']:+d})" for d in divergences)
+                                await bot.notify_owner(
+                                    "🚨 <b>Position reconciliation MISMATCH</b>\n" + detail +
+                                    "\n\nInternal state and the Dhan account disagree — verify "
+                                    "before trusting the bot's positions or square-off.")
+                                log.error("Reconciliation mismatch: %s", divergences)
+                        elif divergences is not None and reconcile_sig is not None:
+                            reconcile_sig = None  # back in sync — reset so a future drift re-alerts
+                            log.info("Reconciliation clean again")
+                    except Exception as e:
+                        log.error("Reconciliation failed: %s", e)
 
                 # Generation window: not before GEN_RESUME_AFTER (lets the opening
                 # scalp own the first minutes) and not after GEN_HALT_AFTER (so
@@ -501,6 +633,11 @@ async def run() -> None:
                         try:
                             spots = await asyncio.to_thread(get_index_spots, session)
                             if spots:
+                                last_feed_ok = time.monotonic()
+                                if feed_alerted:
+                                    await bot.notify_owner("✅ <b>Market-data feed recovered.</b>")
+                                    feed_alerted = False
+                                    log.info("Market-data feed recovered")
                                 fire, reason, idxs = opt_trigger.check(spots)
                                 if fire:
                                     log.info("Option scan triggered (%s)", reason or "—")
@@ -508,6 +645,17 @@ async def run() -> None:
                                     opt_trigger.commit(spots)
                         except Exception as e:
                             log.error("Option generation failed: %s", e)
+                        # Feed-stale watchdog: a blind loop can't track stops or square
+                        # off, so alert the owner ONCE if quotes dry up mid-session.
+                        if FEED_ALERTS_ENABLED:
+                            stale = time.monotonic() - last_feed_ok
+                            if stale > FEED_STALE_SEC and not feed_alerted:
+                                await bot.notify_owner(
+                                    f"⚠️ <b>Market-data feed stale</b> — no index quotes for "
+                                    f"~{stale:.0f}s. Tracking, stops and square-off may be blind. "
+                                    f"Check the Dhan feed/token.")
+                                feed_alerted = True
+                                log.error("Market-data feed stale for %.0fs — owner alerted", stale)
 
                     # 3) Slower cadence for equity/futures/commodity.
                     if other_categories and (

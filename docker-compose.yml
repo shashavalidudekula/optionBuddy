@@ -42,6 +42,13 @@ services:
       - ./logs:/app/logs
     networks:
       - trading-network
+    healthcheck:
+      # Loop writes logs/heartbeat every iteration; stale ⇒ hung/dead ⇒ unhealthy.
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     logging:
       driver: "json-file"
       options:

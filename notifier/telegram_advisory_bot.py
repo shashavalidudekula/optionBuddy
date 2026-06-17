@@ -32,7 +32,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_START_CAPITAL
+from config.settings import TELEGRAM_ENABLED, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_START_CAPITAL
 from config.logger import get_logger
 from data.advisory_store import (
     CATEGORIES,
@@ -715,6 +715,15 @@ class TelegramAdvisoryBot:
     """Advisory-only Telegram bot with subscriber management and call push."""
 
     def __init__(self):
+        # _polling gates every outbound send: when Telegram is unreachable (e.g. an
+        # ISP block — periodic in India), sends are skipped instantly instead of
+        # blocking ~24s each on a network timeout and stalling the whole loop.
+        self._polling = False
+        self._build_app()
+
+    def _build_app(self) -> None:
+        """(Re)build the PTB Application + handlers. Used at init and on reconnect
+        (a shut-down Application can't be restarted, so a retry needs a fresh one)."""
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         self._setup_handlers()
 
@@ -1056,6 +1065,8 @@ class TelegramAdvisoryBot:
 
     async def push_new_call(self, call: dict, call_id: int) -> None:
         """Broadcast a fresh call to all subscribers of its category."""
+        if not self._polling:
+            return  # Telegram down — skip instantly (the call is still saved + tracked)
         text = format_call(call, call_id)
         recipients = get_subscribers_for_category(call.get("category", ""))
         sent = 0
@@ -1071,6 +1082,8 @@ class TelegramAdvisoryBot:
 
     async def push_call_event(self, event: dict) -> None:
         """Broadcast a lifecycle update (target/SL/expiry) to subscribers of the category."""
+        if not self._polling:
+            return  # Telegram down — skip instantly (events still drive paper trading)
         text = format_event(event)
         recipients = get_subscribers_for_category(event.get("category", ""))
         for sub in recipients:
@@ -1083,6 +1096,8 @@ class TelegramAdvisoryBot:
 
     async def broadcast(self, text: str, parse_mode: str = "Markdown") -> None:
         """Broadcast a plain message to all active subscribers."""
+        if not self._polling:
+            return  # Telegram down — skip instantly
         from data.advisory_store import get_all_active_subscribers
         for sub in get_all_active_subscribers():
             try:
@@ -1094,8 +1109,8 @@ class TelegramAdvisoryBot:
 
     async def notify_owner(self, text: str, parse_mode: str = "HTML") -> None:
         """Send a private message to the account owner only (e.g. paper-trade fills)."""
-        if not TELEGRAM_CHAT_ID:
-            return
+        if not TELEGRAM_CHAT_ID or not self._polling:
+            return  # no owner set, or Telegram down — skip instantly
         try:
             await self.app.bot.send_message(
                 chat_id=int(TELEGRAM_CHAT_ID), text=text, parse_mode=parse_mode
@@ -1106,13 +1121,57 @@ class TelegramAdvisoryBot:
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start_polling(self) -> None:
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
-        log.info("Advisory Telegram bot polling started")
+        """Start Telegram polling. NON-FATAL: if Telegram is unreachable at boot
+        (e.g. an ISP block — common in India), log it and return so the
+        paper-trading engine, tracking and dashboard keep running. A background
+        task retries until Telegram is reachable, then resumes alerts."""
+        if not TELEGRAM_ENABLED:
+            self._polling = False
+            log.warning("Telegram DISABLED by config (TELEGRAM_ENABLED=false) — "
+                        "running WITHOUT alerts; paper trading, tracking and the "
+                        "dashboard are unaffected. No polling/retry will be attempted.")
+            return
+        try:
+            await self.app.initialize()
+            await self.app.start()
+            await self.app.updater.start_polling(drop_pending_updates=True)
+            self._polling = True
+            log.info("Advisory Telegram bot polling started")
+        except Exception as e:  # noqa: BLE001
+            self._polling = False
+            log.error("Telegram unavailable at startup (%s) — running WITHOUT alerts; "
+                      "paper trading, tracking and the dashboard are unaffected. "
+                      "Retrying Telegram in the background.", e)
+            try:
+                await self.app.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            asyncio.create_task(self._retry_polling())
+
+    async def _retry_polling(self, interval_sec: int = 120) -> None:
+        """Reconnect to Telegram in the background once it's reachable again."""
+        while not self._polling:
+            await asyncio.sleep(interval_sec)
+            try:
+                self._build_app()  # fresh Application; the old one was shut down
+                await self.app.initialize()
+                await self.app.start()
+                await self.app.updater.start_polling(drop_pending_updates=True)
+                self._polling = True
+                log.info("Telegram reconnected — polling + alerts resumed.")
+                await self.notify_owner("✅ Telegram reconnected — alerts resumed.")
+            except Exception as e:  # noqa: BLE001
+                log.warning("Telegram still unreachable, retrying in %ss: %s", interval_sec, e)
 
     async def stop(self) -> None:
-        await self.app.updater.stop()
-        await self.app.stop()
-        await self.app.shutdown()
-        log.info("Advisory Telegram bot stopped")
+        if not self._polling:
+            return  # never started (Telegram was down at boot) — nothing to stop
+        try:
+            await self.app.updater.stop()
+            await self.app.stop()
+            await self.app.shutdown()
+            log.info("Advisory Telegram bot stopped")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Telegram stop failed: %s", e)
+        finally:
+            self._polling = False

@@ -14,3 +14,6 @@ Kronos/
 
 # Local-only compose overrides (port exposure for debugging) — never deploy to prod
 docker-compose.override.yml
+
+# Exported PRODUCTION data (real account/trading data) — analysis only, NEVER commit.
+prod_data/

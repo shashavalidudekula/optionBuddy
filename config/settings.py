@@ -86,6 +86,10 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 # -- Telegram -----------------------------------------------------------------
+# Master switch: set false to skip Telegram entirely (no init/polling/retry) when
+# it's unreachable — e.g. the Indian govt block (to ~22 Jun). Paper trading,
+# tracking and the dashboard run unaffected; flip back to true to resume alerts.
+TELEGRAM_ENABLED   = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -112,10 +116,17 @@ PAPER_MAX_LOTS          = int(os.getenv("PAPER_MAX_LOTS", "10"))
 PAPER_MAX_OPEN          = int(os.getenv("PAPER_MAX_OPEN", "0"))         # max concurrent positions (0 = unlimited; capital is the only limit)
 PAPER_DAILY_LOSS_PCT    = float(os.getenv("PAPER_DAILY_LOSS_PCT", "0.04"))  # halt new entries for the day
 PAPER_PARTIAL_FRACTION  = float(os.getenv("PAPER_PARTIAL_FRACTION", "0.6"))  # book this much at T1 (60%); hold 40% for T2
-# Flat all-in round-trip cost (brokerage + STT + exchange + GST + slippage proxy)
-# charged ONCE per position when it fully closes, so paper P&L reflects what you'd
-# actually net. Realistic intraday option strategies live or die on this number.
+# Flat all-in round-trip cost (brokerage + STT + exchange + GST) charged ONCE per
+# position when it fully closes, so paper P&L reflects what you'd actually net.
+# Realistic intraday option strategies live or die on this number.
 PAPER_COST_PER_TRADE    = float(os.getenv("PAPER_COST_PER_TRADE", "100"))
+# Adverse slippage per MARKET fill, as a fraction of the option premium. Applied
+# to: the entry pay-up (you cross the spread), the protective stop (it fills WORSE
+# than its trigger) and every other market exit (EOD/expiry/invalidation/manual).
+# Limit/target exits (T1/T2) are NOT slipped — a resting limit fills at its level.
+# Modelling zero slippage was the single biggest source of paper-P&L optimism;
+# option books are wide, especially near expiry. 0 disables (back to old behaviour).
+PAPER_SLIPPAGE_PCT      = float(os.getenv("PAPER_SLIPPAGE_PCT", "0.01"))  # 1% of premium/leg
 # Per-trade risk cap (bound the worst-case loss on ANY single trade). A pricey
 # BankNifty premium with a wide stop can lose ₹10k on one SL hit, blowing the
 # day's budget. Size every position so its worst case (entry→SL) is at most the
@@ -145,6 +156,18 @@ PAPER_LOT_SIZES = {
     "NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 65,
     "MIDCPNIFTY": 120, "SENSEX": 20, "BANKEX": 30,
 }
+
+# -- Option-selling margin (paper books B: opt_sell_*) -------------------------
+# Selling blocks SPAN+exposure margin, which the long-only paper model never needed.
+# These per-lot rupee figures are APPROXIMATIONS for paper sizing only — SEBI/exchange
+# margins change and vary intraday; CALIBRATE against Dhan's margin calculator before
+# trusting capital adequacy (see GO_LIVE_CRITERIA.md). Defined-risk spreads instead
+# block ≈ max-loss (computed from strike width − net credit), far less than naked.
+NAKED_MARGIN_PER_LOT = {
+    "NIFTY": 110000, "BANKNIFTY": 160000, "FINNIFTY": 110000,
+    "MIDCPNIFTY": 90000, "SENSEX": 140000, "BANKEX": 150000,
+}
+MARGIN_DEFAULT_PER_LOT = float(os.getenv("MARGIN_DEFAULT_PER_LOT", "120000"))  # unknown underlying
 
 # -- Timing -------------------------------------------------------------------
 POLL_INTERVAL_SEC  = int(os.getenv("POLL_INTERVAL_SEC", "5"))   # fast loop: tracking + trigger checks
@@ -183,6 +206,45 @@ SCALP_GAPDN_ENTRY_MIN = int(os.getenv("SCALP_GAPDN_ENTRY_MIN", "1"))   # min aft
 SCALP_HOLD_MIN        = int(os.getenv("SCALP_HOLD_MIN", "4"))          # hard exit after N minutes
 SCALP_TARGET_PCT      = float(os.getenv("SCALP_TARGET_PCT", "0"))      # premium % target (0 = timer only)
 SCALP_STOP_PCT        = float(os.getenv("SCALP_STOP_PCT", "0"))        # premium % stop   (0 = timer only)
+
+# -- Deterministic option selling (opt_sell_spread / opt_sell_naked) -----------
+# Generate synthetic short-volatility calls daily (one per underlying). Spreads
+# limit max loss; naked shorts have unlimited loss but higher credit. Both routes
+# to their own paper books, margin-constrained, with realistic slippage on exits.
+SELLING_ENABLED       = os.getenv("SELLING_ENABLED", "false").lower() == "true"
+SELLING_UNDERLYINGS   = tuple(
+    u.strip() for u in os.getenv("SELLING_UNDERLYINGS", "NIFTY,BANKNIFTY").split(",") if u.strip()
+)
+SELLING_STRUCTURE     = os.getenv("SELLING_STRUCTURE", "spread").lower()  # "spread" | "naked"
+SELLING_DELTA_TARGET  = float(os.getenv("SELLING_DELTA_TARGET", "0.25"))  # pick strike near this delta
+SELLING_SPREAD_WIDTH  = int(os.getenv("SELLING_SPREAD_WIDTH", "100"))     # strike width for spreads (points)
+SELLING_EXIT_TAKE_PCT = float(os.getenv("SELLING_EXIT_TAKE_PCT", "0.5"))  # take profit at this % of credit
+SELLING_EXIT_STOP_MULTIPLE = float(os.getenv("SELLING_EXIT_STOP_MULTIPLE", "2.0"))  # stop at this × credit/width
+SELLING_HOLD_DAYS     = int(os.getenv("SELLING_HOLD_DAYS", "7"))          # hard exit after this many days
+
+# -- Equity factor strategy (momentum + low-vol, swing/month) -------------------
+# Best evidence-based retail play in India: low-turnover momentum rank + quality
+# filter on large-cap equities (NIFTY50 / NIFTYNXT50 or custom universe). Monthly
+# rebalance; ~5 concurrent longs. No LLM, no prediction — pure factor exposure.
+EQUITY_FACTOR_ENABLED = os.getenv("EQUITY_FACTOR_ENABLED", "false").lower() == "true"
+EQUITY_FACTOR_UNIVERSE = tuple(
+    u.strip() for u in os.getenv("EQUITY_FACTOR_UNIVERSE", "TCS,INFY,WIPRO,MARUTI,BAJAJFINSV").split(",") if u.strip()
+)
+EQUITY_FACTOR_REBALANCE_DOW = int(os.getenv("EQUITY_FACTOR_REBALANCE_DOW", "0"))  # day of week (0=Mon)
+EQUITY_FACTOR_MIN_MOMENTUM_PCT = float(os.getenv("EQUITY_FACTOR_MIN_MOMENTUM_PCT", "0.0"))  # min 1-month return %
+EQUITY_FACTOR_MAX_VOL_PERCENTILE = float(os.getenv("EQUITY_FACTOR_MAX_VOL_PERCENTILE", "60.0"))  # vol <= this %ile
+
+# -- Stock options (illiquid, high caution; buying only) -------------------------
+# ATM calls on high-volume liquid stocks. ILLIQUIDITY WARNING: Indian stock option
+# spreads are brutal; many don't trade; fills are optimistic. Use only to measure
+# and validate against live Dhan data before deploying capital. Buying ONLY.
+STOCK_OPT_ENABLED = os.getenv("STOCK_OPT_ENABLED", "false").lower() == "true"
+STOCK_OPT_UNDERLYINGS = tuple(
+    u.strip() for u in os.getenv("STOCK_OPT_UNDERLYINGS", "TCS,INFY,WIPRO").split(",") if u.strip()
+)
+STOCK_OPT_MIN_CONFIDENCE = int(os.getenv("STOCK_OPT_MIN_CONFIDENCE", "75"))
+STOCK_OPT_MIN_OI = int(os.getenv("STOCK_OPT_MIN_OI", "100"))  # Avoid zero-OI contracts
+STOCK_OPT_HOLD_DAYS = int(os.getenv("STOCK_OPT_HOLD_DAYS", "7"))
 
 # -- Live generation engine ---------------------------------------------------
 # index_option calls are event-driven: regenerate when the market actually moves,
@@ -256,3 +318,23 @@ BASE_DIR           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH            = os.path.join(BASE_DIR, "data", "trading.db")
 LOG_DIR            = os.path.join(BASE_DIR, "logs")
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "30"))  # dated daily logs to keep (0 = forever)
+
+# -- Health / watchdog --------------------------------------------------------
+# The main loop writes a heartbeat (epoch seconds) every iteration. scripts/
+# healthcheck.py reads it for the Docker HEALTHCHECK; if the loop hangs or the
+# process dies, the heartbeat goes stale and the container is marked unhealthy.
+# Lives under LOG_DIR (a shared RW volume), so the dashboard can read it too.
+HEARTBEAT_PATH      = os.getenv("HEARTBEAT_PATH", os.path.join(LOG_DIR, "heartbeat"))
+HEARTBEAT_STALE_SEC = int(os.getenv("HEARTBEAT_STALE_SEC", "60"))  # > this ⇒ unhealthy
+# Feed-stale alert: during the active polling window, if no index quotes come back
+# for this long, the owner gets ONE Telegram alert (and a recovery note) — because
+# a blind loop can't track stops or square off. 0 / false disables.
+FEED_ALERTS_ENABLED = os.getenv("FEED_ALERTS_ENABLED", "true").lower() == "true"
+FEED_STALE_SEC      = int(os.getenv("FEED_STALE_SEC", "120"))
+
+# Position reconciliation (LIVE only): periodically compare internal open positions
+# against the broker's actual book and alert the owner on any mismatch (a rejected /
+# partial fill leaves the two out of sync). Read-only — never places orders. No-op
+# in paper mode (there is no broker book to compare against).
+RECONCILE_ENABLED      = os.getenv("RECONCILE_ENABLED", "true").lower() == "true"
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))
