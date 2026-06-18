@@ -222,6 +222,13 @@ SELLING_SPREAD_WIDTH  = int(os.getenv("SELLING_SPREAD_WIDTH", "100"))     # stri
 SELLING_EXIT_TAKE_PCT = float(os.getenv("SELLING_EXIT_TAKE_PCT", "0.5"))  # take profit at this % of credit
 SELLING_EXIT_STOP_MULTIPLE = float(os.getenv("SELLING_EXIT_STOP_MULTIPLE", "2.0"))  # stop at this × credit/width
 SELLING_HOLD_DAYS     = int(os.getenv("SELLING_HOLD_DAYS", "7"))          # hard exit after this many days
+# VRP timing: only sell when IV-rank (India-VIX percentile over the lookback) is high
+# enough that premium is rich. DTE = days-to-expiry for new condors.
+SELLING_IV_RANK_MIN   = float(os.getenv("SELLING_IV_RANK_MIN", "0.30"))  # 0..1; stand aside BELOW this
+SELLING_IV_RANK_MAX   = float(os.getenv("SELLING_IV_RANK_MAX", "1.00"))  # 0..1; stand aside ABOVE this
+#   ^ real NIFTY data showed crisis-high VIX is where short condors get run over;
+#     gating to a MID band (e.g. 0.30–0.85) cuts the tail. Tune via backtest.
+SELLING_DTE           = int(os.getenv("SELLING_DTE", "7"))               # days to expiry for new condors
 
 # -- Equity factor strategy (momentum + low-vol, swing/month) -------------------
 # Best evidence-based retail play in India: low-turnover momentum rank + quality
@@ -246,6 +253,21 @@ STOCK_OPT_UNDERLYINGS = tuple(
 STOCK_OPT_MIN_CONFIDENCE = int(os.getenv("STOCK_OPT_MIN_CONFIDENCE", "75"))
 STOCK_OPT_MIN_OI = int(os.getenv("STOCK_OPT_MIN_OI", "100"))  # Avoid zero-OI contracts
 STOCK_OPT_HOLD_DAYS = int(os.getenv("STOCK_OPT_HOLD_DAYS", "7"))
+
+# -- Stat-arb pairs (market-neutral mean reversion; backtest-first) -------------
+# Trade the z-score of a cointegrated spread back to its mean, beta-weighted so the
+# book is market-neutral. OFF until it passes a backtest. PAIRS_LIST is "A:B,C:D".
+PAIRS_ENABLED       = os.getenv("PAIRS_ENABLED", "false").lower() == "true"
+PAIRS_LIST          = tuple(p.strip() for p in os.getenv(
+    "PAIRS_LIST", "HDFCBANK:ICICIBANK,TCS:INFY").split(",") if p.strip())
+PAIRS_ENTRY_Z       = float(os.getenv("PAIRS_ENTRY_Z", "2.0"))   # enter when |z| >= this
+PAIRS_EXIT_Z        = float(os.getenv("PAIRS_EXIT_Z", "0.5"))    # take profit near the mean
+PAIRS_STOP_Z        = float(os.getenv("PAIRS_STOP_Z", "3.5"))    # stop if the spread blows out
+PAIRS_MAX_HALF_LIFE = float(os.getenv("PAIRS_MAX_HALF_LIFE", "30"))  # days; skip slow reverters
+PAIRS_MIN_CORR      = float(os.getenv("PAIRS_MIN_CORR", "0.80"))
+PAIRS_LOOKBACK      = int(os.getenv("PAIRS_LOOKBACK", "90"))     # days for hedge ratio / z
+PAIRS_MAX_DAYS      = int(os.getenv("PAIRS_MAX_DAYS", "20"))     # time stop
+PAIRS_ALLOC         = float(os.getenv("PAIRS_ALLOC", "100000"))  # capital per leg-A notional
 
 # -- Live generation engine ---------------------------------------------------
 # index_option calls are event-driven: regenerate when the market actually moves,
