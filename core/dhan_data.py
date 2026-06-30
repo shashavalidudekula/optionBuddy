@@ -76,6 +76,16 @@ _BSE_UNDERLYINGS = {"SENSEX", "BANKEX", "SENSEX50"}
 
 # Strike + option type, tolerant of separators ("NIFTY 23400 PE", "NIFTY-...-23400-PE").
 _OPTION_RE = re.compile(r"(\d{3,7})[\s\-]*(CE|PE)\b", re.IGNORECASE)
+# Two-leg credit spread ("NIFTY 23850/23750 PE spread") → (short_strike, wing_strike, type).
+_SPREAD_RE = re.compile(r"(\d{3,7})\s*/\s*(\d{3,7})\s*(CE|PE)\b", re.IGNORECASE)
+
+
+def _spread_legs(instrument: str):
+    """(short_strike, wing_strike, opt_type) for a spread instrument, or None."""
+    m = _SPREAD_RE.search(instrument or "")
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2)), m.group(3).upper()
 
 # ── module caches ────────────────────────────────────────────────────────────
 _master: list[dict] = []          # scrip-master rows (normalised UPPER keys)
@@ -691,14 +701,16 @@ def get_positions(session) -> list[dict]:
 
 
 def make_price_lookup(session):
-    """Return `price_lookup(call) -> float | None` backed by Dhan LTP."""
+    """Return `price_lookup(call) -> float | None` backed by Dhan LTP.
+
+    A credit-SPREAD instrument ("NIFTY 23850/23750 PE spread") is priced as the NET
+    of both legs (short premium − wing premium) — i.e. the cost to close the short
+    spread, comparable to its entry net-credit, 0.5× target and 2× stop. Pricing it
+    as a single leg (the old behaviour) over-marked spreads at ~3-5× their value and
+    tripped the SELL stop on the first poll (instant phantom max-loss)."""
     cache: dict[str, tuple[float, float]] = {}
 
-    def lookup(call: dict) -> float | None:
-        code = resolve_scrip_for_call(call)
-        if not code:
-            return None
-        now = time.time()
+    def _ltp(code: str, now: float) -> float | None:
         hit = cache.get(code)
         if hit and (now - hit[1]) < _PRICE_TTL_SEC:
             return hit[0]
@@ -706,5 +718,26 @@ def make_price_lookup(session):
         if price is not None:
             cache[code] = (price, now)
         return price
+
+    def lookup(call: dict) -> float | None:
+        now = time.time()
+        instrument = str(call.get("instrument") or "")
+        legs = _spread_legs(instrument) if call.get("category") == "index_option" else None
+        if legs:
+            short_k, wing_k, ot = legs
+            undl = str(call.get("underlying") or "").strip()
+            exp = _coerce_expiry(call.get("option_expiry"))
+            short_code = _option_scrip(undl, short_k, ot, expiry=exp)
+            wing_code = _option_scrip(undl, wing_k, ot, expiry=exp)
+            if not (short_code and wing_code):
+                return None
+            sp, wp = _ltp(short_code, now), _ltp(wing_code, now)
+            if sp is None or wp is None:
+                return None
+            return round(sp - wp, 2)   # net cost to close the short spread
+        code = resolve_scrip_for_call(call)
+        if not code:
+            return None
+        return _ltp(code, now)
 
     return lookup
