@@ -9,6 +9,8 @@ own container with zero risk of interfering with the live engine.
 
 Run:  uvicorn web.dashboard:app --host 0.0.0.0 --port 8000
 Optional basic auth: set DASHBOARD_USER and DASHBOARD_PASS in the environment.
+Optional strategy filter: set DASHBOARD_STRATEGY to show only one strategy/account
+  (e.g., DASHBOARD_STRATEGY=opt_buy). If unset, shows all enabled strategies.
 """
 
 import os
@@ -41,6 +43,10 @@ from data.paper_history import daily_pnl, weekly_pnl
 
 log = get_logger("dashboard")
 
+_DASHBOARD_STRATEGY = os.getenv("DASHBOARD_STRATEGY", "").strip().lower() or None
+if _DASHBOARD_STRATEGY:
+    log.info("Dashboard filtering to strategy: %s", _DASHBOARD_STRATEGY)
+
 app = FastAPI(title="OptionBuddy Dashboard", docs_url=None, redoc_url=None)
 
 # Which books to surface, with the same capital tiers main_advisory uses. opt_buy
@@ -56,7 +62,8 @@ _BOOK_CAPITAL = {
 
 
 def _enabled_books() -> dict:
-    """The books this deployment runs (opt_buy always; others by config flag)."""
+    """The books this deployment runs (opt_buy always; others by config flag).
+    If DASHBOARD_STRATEGY is set, returns only that strategy."""
     books = {DEFAULT_STRATEGY: _BOOK_CAPITAL[DEFAULT_STRATEGY]}
     if SELLING_ENABLED:
         books["opt_sell_spread"] = _BOOK_CAPITAL["opt_sell_spread"]
@@ -66,6 +73,12 @@ def _enabled_books() -> dict:
         books["stock_opt"] = _BOOK_CAPITAL["stock_opt"]
     if EQUITY_FACTOR_ENABLED:
         books["equity_cash"] = _BOOK_CAPITAL["equity_cash"]
+
+    if _DASHBOARD_STRATEGY:
+        if _DASHBOARD_STRATEGY in books:
+            return {_DASHBOARD_STRATEGY: books[_DASHBOARD_STRATEGY]}
+        else:
+            log.warning("DASHBOARD_STRATEGY=%s not in enabled books, falling back to all", _DASHBOARD_STRATEGY)
     return books
 
 

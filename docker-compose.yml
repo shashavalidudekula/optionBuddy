@@ -55,11 +55,11 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  dashboard:
+  dashboard-opt-buy:
     build: .
-    container_name: optionbuddy-dashboard
+    container_name: optionbuddy-dashboard-opt-buy
     restart: unless-stopped
-    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8001"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,15 +71,106 @@ services:
       DB_NAME: trading_agent
       DB_USER: trading_user
       DB_PASSWORD: trading_password
+      DASHBOARD_STRATEGY: opt_buy
       PYTHONUNBUFFERED: 1
       TZ: Asia/Kolkata
     volumes:
-      # Share the logs dir: reads the paper-history ledger for the Daily/Weekly
-      # P&L tables, and writes its own dated log file. Must be read-write — the
-      # logger opens agent-<date>.log for writing on startup (a :ro mount crashes it).
       - ./logs:/app/logs
     ports:
-      - "8000:8000"
+      - "8001:8001"
+    networks:
+      - trading-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard-opt-sell-spread:
+    build: .
+    container_name: optionbuddy-dashboard-opt-sell-spread
+    restart: unless-stopped
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8002"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      DASHBOARD_STRATEGY: opt_sell_spread
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+    ports:
+      - "8002:8002"
+    networks:
+      - trading-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard-stock-opt:
+    build: .
+    container_name: optionbuddy-dashboard-stock-opt
+    restart: unless-stopped
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8003"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      DASHBOARD_STRATEGY: stock_opt
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+    ports:
+      - "8003:8003"
+    networks:
+      - trading-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard-equity-cash:
+    build: .
+    container_name: optionbuddy-dashboard-equity-cash
+    restart: unless-stopped
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8004"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      DASHBOARD_STRATEGY: equity_cash
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+    ports:
+      - "8004:8004"
     networks:
       - trading-network
     logging:
