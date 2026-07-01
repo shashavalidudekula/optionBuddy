@@ -1,40 +1,28 @@
 """
-market_data.py -- Fetch market data for configured instruments via INDstocks + global data via yfinance
+market_data.py -- Global macro cues via yfinance.
+
+Indian instrument prices (indices, equities, F&O, option premiums) are fetched
+from INDstocks in core.indstocks_data. This module only provides the global
+cues that INDstocks does not expose (Brent crude, USD/INR, DXY).
 """
+import time
+
 import yfinance as yf
 
 from config.logger import get_logger
-from config.settings import TRACKED_INDICES, TRACKED_STOCKS, TRACKED_COMMODITIES
 
 log = get_logger("market_data")
 
-
-def fetch_index_data(session) -> dict:
-    """Fetch indices, stocks, and commodities via INDstocks."""
-    result = {}
-    all_ids = TRACKED_INDICES + TRACKED_STOCKS + TRACKED_COMMODITIES
-
-    if not all_ids:
-        return result
-
-    ids_str = ",".join(all_ids)
-
-    try:
-        resp = session.get("/market/quotes/ltp", params={"security_id": ids_str, "exchange_segment": "NSE"})
-        quotes = resp.get("data", [])
-        for q in quotes:
-            security_id = str(q.get("security_id", ""))
-            ltp = float(q.get("last_traded_price", 0))
-            name = q.get("trading_symbol", security_id)
-            if ltp > 0:
-                result[name] = {"ltp": ltp, "security_id": security_id}
-    except Exception as e:
-        log.warning("Market data fetch failed: %s", e)
-
-    return result
+# Macro cues move slowly; cache so event-driven generation (every ~1-2 min) doesn't
+# refetch three yfinance tickers each time.
+_GLOBAL_TTL_SEC = 300
+_global_cache: tuple[dict, float] | None = None
 
 
 def fetch_global_data() -> dict:
+    global _global_cache
+    if _global_cache and (time.time() - _global_cache[1]) < _GLOBAL_TTL_SEC:
+        return _global_cache[0]
     result = {}
     tickers = {
         "crude_brent": "BZ=F",
@@ -48,10 +36,6 @@ def fetch_global_data() -> dict:
                 result[key] = round(float(hist["Close"].iloc[-1]), 4)
         except Exception as e:
             log.warning("%s fetch failed: %s", key, e)
+    if result:
+        _global_cache = (result, time.time())
     return result
-
-
-def get_all_market_data(session) -> dict:
-    data = {**fetch_index_data(session), **fetch_global_data()}
-    log.debug("Market data: %s", data)
-    return data

@@ -1,8 +1,9 @@
 """
 indstocks_auth.py -- INDstocks API session
 
-Auth is a simple access token from the INDstocks dashboard.
-No TOTP, no daily refresh -- token is long-lived.
+Auth is a JWT access token from the INDstocks dashboard.
+NOTE: the token is short-lived — it expires roughly daily (around 07:00 IST),
+so it must be refreshed each trading day (re-copy it and recreate the container).
 
 Get your token:
   1. Login to indstocks.com

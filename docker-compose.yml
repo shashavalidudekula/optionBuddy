@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,6 +7,9 @@ services:
       POSTGRES_DB: trading_agent
       POSTGRES_USER: trading_user
       POSTGRES_PASSWORD: trading_password
+      TZ: Asia/Kolkata
+      PGTZ: Asia/Kolkata
+    command: ["postgres", "-c", "timezone=Asia/Kolkata"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -19,10 +20,11 @@ services:
       timeout: 5s
       retries: 5
 
-  trading-agent:
+  advisory-agent:
     build: .
-    container_name: optionbuddy-trading-agent
+    container_name: optionbuddy-advisory
     restart: unless-stopped
+    command: ["python", "main_advisory.py"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,6 +40,46 @@ services:
       TZ: Asia/Kolkata
     volumes:
       - ./logs:/app/logs
+    networks:
+      - trading-network
+    healthcheck:
+      # Loop writes logs/heartbeat every iteration; stale ⇒ hung/dead ⇒ unhealthy.
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: .
+    container_name: optionbuddy-dashboard
+    restart: unless-stopped
+    command: ["uvicorn", "web.dashboard:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: trading_agent
+      DB_USER: trading_user
+      DB_PASSWORD: trading_password
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Kolkata
+    volumes:
+      # Share the logs dir: reads the paper-history ledger for the Daily/Weekly
+      # P&L tables, and writes its own dated log file. Must be read-write — the
+      # logger opens agent-<date>.log for writing on startup (a :ro mount crashes it).
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
     networks:
       - trading-network
     logging:

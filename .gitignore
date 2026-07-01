@@ -1,6 +1,19 @@
+.env
 .env.example
 node_modules/
 dist/
-*.md
 *.log
-.env
+logs/
+__pycache__/
+*.pyc
+*.md
+send_test_notifications.py
+
+# Kronos model repo — cloned in, not committed (separate upstream project)
+Kronos/
+
+# Local-only compose overrides (port exposure for debugging) — never deploy to prod
+docker-compose.override.yml
+
+# Exported PRODUCTION data (real account/trading data) — analysis only, NEVER commit.
+prod_data/
